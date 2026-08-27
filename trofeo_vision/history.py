@@ -31,16 +31,27 @@ class HistorySample:
 class HistoryBuffer:
     """FIFO ring buffer of recent samples, capped at ``maxlen`` entries.
 
-    At the default 4 fps push rate, 60 samples = 15 s of history — enough
-    to see a clear trend without being too jumpy.
+    Default config targets 1 sample/second for 2 minutes (120 samples) — a
+    rate limit independent of the render/push rate so the chart shows a
+    stable time window even when frames go out faster (4 FPS) or slower.
     """
 
-    def __init__(self, maxlen: int = 60):
+    def __init__(self, maxlen: int = 120, min_interval_s: float = 1.0):
         self.samples: deque[HistorySample] = deque(maxlen=maxlen)
         self.maxlen = maxlen
+        self.min_interval_s = min_interval_s
+        self._last_push_t: float = 0.0
 
-    def push(self, snap: SensorSnapshot) -> None:
-        """Append one tick from a snapshot."""
+    def push(self, snap: SensorSnapshot) -> bool:
+        """Append one tick from a snapshot if the rate limit has elapsed.
+
+        Returns True if a sample was added, False if skipped (too soon).
+        Uses ``snap.timestamp`` so the rate is tied to sample time, not
+        wall clock — replays/dry-runs stay deterministic.
+        """
+        if self.min_interval_s > 0 and (snap.timestamp - self._last_push_t) < self.min_interval_s:
+            return False
+        self._last_push_t = snap.timestamp
         self.samples.append(
             HistorySample(
                 cpu_usage=snap.cpu.usage_percent,
@@ -51,6 +62,12 @@ class HistoryBuffer:
                 gpu_power=snap.gpu.power_w,
             )
         )
+        return True
+
+    @property
+    def seconds_covered(self) -> float:
+        """Seconds of history currently held (0 when empty)."""
+        return len(self.samples) * self.min_interval_s
 
     # ── Accessors used by the renderer ───────────────────────────────
     def cpu_tuples(self) -> list[tuple[float, float, float]]:

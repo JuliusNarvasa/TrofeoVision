@@ -58,8 +58,8 @@ class T:
     HERO_BIG    = 72     # big % number
     HERO_LABEL  = 18     # "CPU USAGE"
     GRID_LBL    = 14     # "CPU FAN", "CLOCK", etc
-    GRID_VAL    = 18     # main value (small enough that " MHz" / " RPM" fits inline)
-    GRID_UNIT   = 12     # inline unit suffix ("MHz", "RPM")
+    GRID_VAL    = 22     # main value (bigger so the measurement reads at distance)
+    GRID_UNIT   = 14     # inline unit suffix ("MHz", "RPM") — still smaller + dimmer than value
     HERO_SUB_LBL = 18    # "TEMP", "POWER"
     HERO_SUB_VAL = 24    # "54°", "48W"
     METRIC_VAL  = 42     # RAM/ROM/FPS big
@@ -152,16 +152,19 @@ def draw_section_header(draw: ImageDraw.ImageDraw, y: int, title: str) -> int:
 
 def draw_usage_hero(draw, x, y, w, h, big_value: str, label: str, temp_str: str,
                      power_str: str, tag: str = "ON DEMAND",
-                     history: Optional[list] = None,
-                     hist_label: str = "60s HISTORY"):
-    """Big-number hero card with usage, temp, power, and a history chart.
+                     history: Optional[list] = None):
+    """Big-number hero card with usage, temp, power, and a horizontal chart strip.
+
+    Designed for a wide-but-short card (414×340 in the current layout).
+    The full card width is used so the history chart is ~2× wider than the
+    old side-by-side layout — gives the line plot real horizontal room to
+    show trends without being cramped.
 
     Layout:
-        [TAG]                          <-- top-left pill
-        20%   CPU USAGE                <-- huge number + label side-by-side
-        TEMP     54°
-        POWER    48W
-        [HISTORY CHART]                <-- mixed usage/temp/power sparklines
+        [TAG]                              <-- top-left pill
+        20%   CPU USAGE     TEMP 54°       <-- big number + label on left,
+                              POWER 48W       stats stacked on right
+        [──── history chart strip ────]    <-- full card width, below stats
 
     ``history`` is a list of (usage%, temp°C, powerW) tuples, oldest first.
     When omitted, the chart area is left blank (still gets its card frame).
@@ -182,35 +185,36 @@ def draw_usage_hero(draw, x, y, w, h, big_value: str, label: str, temp_str: str,
     _text(draw, (x + 20 + pad_x, pill_cy), tag_text,
           font=tag_font, fill=C.TAG_FG, anchor="lm")
 
-    # Big number on its own row, label below it. The font ascender + descender
-    # means textbbox height is much smaller than the actual rendered glyph extent,
-    # so we add a generous gap below the big number for the label.
+    # ── Big number + label (left column) ────────────────────────────
     big_font = _font(SEGOE, T.HERO_BIG)
     lbl_font = _font(SEGOE, T.HERO_LABEL)
-    _text(draw, (x + 20, y + 80), big_value, font=big_font, fill=C.VALUE)
-    # Label well below the big number (font_size is more reliable than textbbox)
-    _text(draw, (x + 20, y + 80 + T.HERO_BIG + 8),
+    _text(draw, (x + 20, y + 50), big_value, font=big_font, fill=C.VALUE)
+    _text(draw, (x + 20, y + 50 + T.HERO_BIG + 8),
           label.upper(), font=lbl_font, fill=C.LABEL)
 
-    # TEMP and POWER rows
+    # ── TEMP and POWER stacked on the right side ────────────────────
     small = _font(SEGOE, T.HERO_SUB_LBL)
     val = _font(SEGOE, T.HERO_SUB_VAL)
-    rows_y_start = y + 80 + T.HERO_BIG + 8 + 36
-    _text(draw, (x + 20, rows_y_start), "TEMP", font=small, fill=C.LABEL)
-    _text(draw, (x + 20 + 110, rows_y_start), temp_str, font=val, fill=C.VALUE)
-    _text(draw, (x + 20, rows_y_start + 42), "POWER", font=small, fill=C.LABEL)
-    _text(draw, (x + 20 + 110, rows_y_start + 42), power_str, font=val, fill=C.VALUE)
+    # Right column starts a bit past card mid-line so the big number has
+    # room to breathe. Value column offset to the right of the label so
+    # values are visually grouped.
+    right_label_x = x + w // 2 + 30
+    right_val_x = right_label_x + 90
+    _text(draw, (right_label_x, y + 50), "TEMP", font=small, fill=C.LABEL)
+    _text(draw, (right_val_x, y + 50), temp_str, font=val, fill=C.VALUE)
+    _text(draw, (right_label_x, y + 92), "POWER", font=small, fill=C.LABEL)
+    _text(draw, (right_val_x, y + 92), power_str, font=val, fill=C.VALUE)
 
-    # History chart fills the bottom of the card. Replaces the old thin
-    # progress bar — the chart conveys trends, which is more informative
-    # than a single fill level that duplicates the big usage number above.
+    # ── History chart strip — full card width ───────────────────────
+    # Below the stats area; height is whatever the card has left after
+    # the stats block + 20px bottom padding.
     chart_x = x + 20
-    chart_y = y + 300
+    chart_y = y + 180
     chart_w = w - 40
-    chart_h = 170
+    chart_h = h - 180 - 20
     samples = history if history is not None else []
     draw_mixed_history_chart(draw, chart_x, chart_y, chart_w, chart_h,
-                             samples, label=hist_label)
+                             samples)
 
 
 def draw_side_grid(draw, x, y, w, h, items):
@@ -251,7 +255,82 @@ def draw_side_grid(draw, x, y, w, h, items):
                   unit, font=unit_font, fill=C.LABEL)
 
 
-def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str):
+def draw_misc_strip(draw, x, y, w, h, items):
+    """2×2 grid of sub-stats inside ONE big card.
+
+    Sits below the hero card. All four cells share a single rounded
+    rectangle, separated by a vertical divider (between columns) and a
+    horizontal divider (between rows). In each cell the label sits at
+    top-left and the value sits at bottom-right (right-aligned), so the
+    four cells read as a balanced 2×2 dashboard.
+
+    items can be (label, value) or (label, value, unit). When a unit is
+    provided it's rendered inline after the value in a smaller font —
+    same pattern as draw_side_grid.
+    """
+    # Single shared card for the whole 2×2.
+    _round_rect(draw, (x, y, x + w, y + h), radius=14, fill=C.CARD, outline=C.CARD_EDGE)
+    pad_outer = 16
+    cols = 2
+    rows = 2
+    cell_w = (w - pad_outer * 2) // cols
+    cell_h = (h - pad_outer * 2) // rows
+    lbl_font = _font(SEGOE, T.GRID_LBL)
+    val_font = _font(SEGOE, T.GRID_VAL)
+    unit_font = _font(SEGOE, T.GRID_UNIT)
+
+    # Cross dividers — vertical down the middle, horizontal across the middle.
+    # Inset by ``pad_outer`` so the lines don't kiss the rounded corners.
+    cx_mid = x + pad_outer + cell_w
+    cy_mid = y + pad_outer + cell_h
+    draw.line((cx_mid, y + pad_outer, cx_mid, y + h - pad_outer),
+              fill=C.DIVIDER, width=1)
+    draw.line((x + pad_outer, cy_mid, x + w - pad_outer, cy_mid),
+              fill=C.DIVIDER, width=1)
+
+    for idx, item in enumerate(items[:4]):
+        if len(item) == 2:
+            label, value = item
+            unit = None
+        else:
+            label, value, unit = item
+        col = idx % cols
+        row = idx // cols
+        # Cell origin (top-left of the cell, after pad_outer).
+        cell_x = x + pad_outer + col * cell_w
+        cell_y = y + pad_outer + row * cell_h
+        cell_right = cell_x + cell_w
+        cell_bottom = cell_y + cell_h
+        # Inset for label/values so they don't sit flush against the
+        # divider lines (the right-column label was touching the divider
+        # before this padding was added).
+        inner_pad_x = 12
+        inner_pad_y = 8   # extra room above the label so the bottom-row
+                           # header doesn't sit right on the horizontal divider
+        # Label at top-left of the cell, offset by inner_pad so it has
+        # breathing room from both the card edge (left col) and the
+        # divider (right col).
+        _text(draw, (cell_x + inner_pad_x, cell_y + inner_pad_y), label.upper(),
+              font=lbl_font, fill=C.LABEL)
+        # Value (with unit glued to its right) is centered in the cell —
+        # both horizontally and vertically — so each quadrant reads as a
+        # balanced labelled cell rather than left/right-anchored.
+        vw, vh = _text_wh(draw, value, val_font)
+        uw = _text_wh(draw, unit, unit_font)[0] if unit else 0
+        gap = 4
+        combined_w = vw + (gap + uw if unit else 0)
+        pair_x = cell_x + (cell_w - combined_w) // 2
+        val_y = cell_y + (cell_h - vh) // 2
+        _text(draw, (pair_x, val_y), value, font=val_font, fill=C.VALUE)
+        if unit:
+            # Vertically center the smaller unit against the larger value glyph.
+            uh = _text_wh(draw, unit, unit_font)[1]
+            unit_y = val_y + (vh - uh) // 2
+            _text(draw, (pair_x + vw + gap, unit_y), unit,
+                  font=unit_font, fill=C.LABEL)
+
+
+def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str = ""):
     """Small mixed line chart: usage / temp / power, all normalized.
 
     ``samples`` is a list of ``(usage%, temp°C, powerW)`` tuples, oldest
@@ -259,15 +338,17 @@ def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str):
     stays in the same vertical position even when the absolute value is
     low) — this gives stable visual range across loads.
 
-    The card has a header row with the title + 3 colored legend dots,
-    then a plot area with 2 gridlines and the three lines drawn on top.
+    The card has an optional title row (pass ``label=""`` to skip) plus
+    3 colored legend dots on the right, then a plot area with 2 gridlines
+    and the three lines drawn on top.
     """
     _round_rect(draw, (x, y, x + w, y + h), radius=10,
                 fill=C.CARD, outline=C.CARD_EDGE)
 
-    # ── Header row (title + legend dots) ────────────────────────────
+    # ── Header row (optional title + legend dots) ──────────────────
     title_font = _font(SEGOE, T.HIST_TITLE)
-    _text(draw, (x + 12, y + 8), label, font=title_font, fill=C.LABEL)
+    if label:
+        _text(draw, (x + 12, y + 8), label, font=title_font, fill=C.LABEL)
 
     # 3 colored dots, right-aligned in the header row, each with a tiny
     # abbreviated label so the user knows what each color means.
@@ -293,7 +374,8 @@ def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str):
 
     # ── Inner plot area ─────────────────────────────────────────────
     pad_l, pad_r = 12, 12
-    pad_t = 28         # leave room for header
+    # Less header padding when there's no title — gives the plot more room.
+    pad_t = 12 if not label else 28
     pad_b = 14         # leave a little breathing room at the bottom
     px = x + pad_l
     py = y + pad_t
@@ -510,45 +592,47 @@ class Renderer:
         # Pull sample lists out of the history buffer (or empty if None).
         cpu_hist = history.cpu_tuples() if history is not None else []
         gpu_hist = history.gpu_tuples() if history is not None else []
-        # The label reflects the buffer size so the user sees when the
-        # chart is still filling up (e.g. "12s HISTORY" -> "60s HISTORY").
-        hist_label = f"{len(cpu_hist)}s HISTORY"
+
+        # Two-row stack per section: hero card (with chart strip) on top,
+        # misc tiles strip below. Hero gets the favored ~63% of the height
+        # so the usage number and history chart both breathe.
+        section_h = 540
+        hero_h = 340
+        gap = 16
+        misc_h = section_h - hero_h - gap  # 184
+        card_w = self.width - 24 * 2
+        left_x = 24
 
         y = 30
         # ── CPU section ──────────────────────────────────────────────
         y = draw_section_header(d, y, "CPU STATUS MONITORING")
-        cpu_h = 540
-        cpu_card_w = (self.width - 24 * 2 - 12) // 2
-        left_x = 24
-        right_x = left_x + cpu_card_w + 12
-        draw_usage_hero(d, left_x, y, cpu_card_w, cpu_h,
+        draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.cpu.usage_str, "CPU USAGE",
                         snap.cpu.temp_str, snap.cpu.power_str,
                         tag="ON DEMAND",
-                        history=cpu_hist, hist_label=hist_label)
-        draw_side_grid(d, right_x, y, cpu_card_w, cpu_h, [
+                        history=cpu_hist)
+        draw_misc_strip(d, left_x, y + hero_h + gap, card_w, misc_h, [
             ("CPU FAN",   snap.cpu.fan_str,   "RPM"),
             ("CPU CLOCK", snap.cpu.clock_str, "MHz"),
             ("AIO PUMP",  snap.cpu.pump_str,  "RPM"),
             ("VOLTAGE",   snap.cpu.voltage_str),
         ])
-        y += cpu_h + 28
+        y += section_h + 28
 
         # ── GPU section ──────────────────────────────────────────────
         y = draw_section_header(d, y, "GPU STATUS MONITORING")
-        gpu_h = 540
-        draw_usage_hero(d, left_x, y, cpu_card_w, gpu_h,
+        draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.gpu.usage_str, "GPU USAGE",
                         snap.gpu.temp_str, snap.gpu.power_str,
                         tag="ON DEMAND",
-                        history=gpu_hist, hist_label=hist_label)
-        draw_side_grid(d, right_x, y, cpu_card_w, gpu_h, [
-            ("VRAM",      snap.gpu.vram_used_str),
-            ("GPU CLOCK", snap.gpu.clock_str, "MHz"),
-            ("GPU FAN",   snap.gpu.fan_str,   "RPM"),
-            ("VOLTAGE",   snap.gpu.voltage_str),
+                        history=gpu_hist)
+        draw_misc_strip(d, left_x, y + hero_h + gap, card_w, misc_h, [
+            ("VRAM",       snap.gpu.vram_used_str),
+            ("GPU CLOCK",  snap.gpu.clock_str,    "MHz"),
+            ("GPU FAN",    snap.gpu.fan_str,      "RPM"),
+            ("VRAM CLOCK", snap.gpu.vram_clock_str, "MHz"),
         ])
-        y += gpu_h + 28
+        y += section_h + 28
 
         # ── Bottom row: 3 mini cards + network + time ─────────────────
         bottom_h = 180

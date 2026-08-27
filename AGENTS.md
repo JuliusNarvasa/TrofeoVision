@@ -41,21 +41,37 @@ to replace the driver with WinUSB for VID `0416` PID `5408`.
 
 ## LAYOUT (offline renderer — current state)
 
+2-row stack per section (hero on top, misc strip below). Hero card is
+full width (414 px) so the usage chart strip is ~2× wider than the old
+side-by-side layout — gives the line plot real horizontal room.
+
 ```
 y=  0
-y= 24 [CPU STATUS MONITORING]                              ← header
-y= 52  [Hero card: ON DEMAND | 0% CPU USAGE     | [2x2 grid:
-y=      | TEMP 0°  POWER 0W      |  CPU FAN | CPU CLOCK
-y=      |                       |  WTR PUMP| VOLTAGE  ]
-y=520 [GPU STATUS MONITORING]
-y=548  [Hero card: ON DEMAND | 0% GPU USAGE     | [2x2 grid:
-y=      | TEMP 0°  POWER 0W      |  VRAM | GPU CLOCK
-y=      |                       |  GPU FAN | VOLTAGE  ]
-y=1020 [RAM 34%] [ROM 56%] [FPS 0]                          ← 3 mini cards
-y=1180 [NETWORK SPEED          ] [TIME              ]
-y=1340 [WeatherFlow (disabled)                     ]
+y= 30 [CPU STATUS MONITORING]                              ← header
+y= 68 [Hero card (full width, 414×340):
+y=    |  [TAG]                  TEMP 62°
+y=    |   47% CPU USAGE         POWER 78W
+y=    |  ┌── history chart strip (USE/TEMP/PWR, no header) ──┐
+y=    |  │                                                  │
+y=    |  └──────────────────────────────────────────────────┘ ]
+y=408 [Misc card (ONE big card, 4 cells with vertical dividers):
+y=    |  CPU FAN  │ CPU CLOCK │ AIO PUMP  │ VOLTAGE         ]
+y=568 [GPU STATUS MONITORING]
+y=606 [Hero card (full width) — same structure as CPU  ]
+y=946 [Misc card: VRAM │ GPU CLOCK │ GPU FAN │ VOLTAGE ]
+y=1148 [RAM 34%] [ROM 56%] [FPS 0]                          ← 3 mini cards
+y=1328 [NETWORK SPEED          ] [TIME              ]
+y=1526 [WeatherFlow (disabled)                     ]
 y=1860 [TROFEO VISION 9.16"  ·  CUSTOM DASHBOARD  PYTHON  ·  PIL  ·  WINUSB]
 ```
+
+**Section split:** `section_h=540`, `hero_h=340` (favored ~63%),
+`gap=16`, `misc_h=184`. Chart strip sits in the bottom of the hero card
+at `y+180`, height = `hero_h - 180 - 20` = `140 px`, width `374 px`.
+
+**History:** ring buffer holds 120 samples at 1 Hz (2 minutes). The
+chart legend (USE/TEMP/PWR dots) is the only chart header — no
+seconds-counter title.
 
 ---
 

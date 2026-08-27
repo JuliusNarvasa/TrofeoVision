@@ -51,6 +51,7 @@ class GpuStats:
     power_w: float = 0.0
     fan_rpm: float = 0.0
     clock_mhz: float = 0.0
+    vram_clock_mhz: float = 0.0    # GDDR memory clock (LHM "GPU Memory" Clock)
     vram_used_mb: float = 0.0
     vram_total_mb: float = 0.0
     voltage_v: float = 0.0
@@ -71,6 +72,12 @@ class GpuStats:
         # Bare MHz number — the renderer appends " MHz" via draw_side_grid's
         # unit suffix (matching how CpuStats.clock_str is rendered).
         return f"{int(round(self.clock_mhz))}"
+    @property
+    def vram_clock_str(self) -> str:
+        if self.vram_clock_mhz <= 0:
+            return "-"
+        # Bare MHz number — renderer appends " MHz" via the misc-strip unit.
+        return f"{int(round(self.vram_clock_mhz))}"
     @property
     def vram_percent(self) -> float:
         if self.vram_total_mb <= 0:

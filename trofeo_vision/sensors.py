@@ -331,6 +331,7 @@ class SensorReader:
         #   "GPU Core" + Temperature -> temp_c
         #   "GPU Package" + Power    -> power_w
         #   "GPU Core" + Clock       -> clock_mhz
+        #   "GPU Memory" + Clock     -> vram_clock_mhz
         #   "GPU Core" + Voltage     -> voltage_v
         #   "GPU Core" + Load        -> usage_percent
         #   "GPU Fan"  + Fan         -> fan_rpm (NOT Control)
@@ -349,6 +350,8 @@ class SensorReader:
                 gpu = GpuStats(**{**gpu.__dict__, "power_w": val})
             elif stype == "Clock" and n == "GPU Core":
                 gpu = GpuStats(**{**gpu.__dict__, "clock_mhz": val})
+            elif stype == "Clock" and n == "GPU Memory":
+                gpu = GpuStats(**{**gpu.__dict__, "vram_clock_mhz": val})
             elif stype == "Voltage" and n == "GPU Core":
                 gpu = GpuStats(**{**gpu.__dict__, "voltage_v": val})
             elif stype == "Load" and n == "GPU Core":
