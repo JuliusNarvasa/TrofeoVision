@@ -24,7 +24,6 @@ import psutil
 
 from .sensors_types import (
     CpuStats,
-    FpsStats,
     GpuStats,
     MemDiskStats,
     NetStats,

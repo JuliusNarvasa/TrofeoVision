@@ -19,9 +19,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from .sensors_types import SensorSnapshot
+from .weather import (
+    WeatherImages,
+    greeting_for_bucket,
+    icon_to_state,
+    time_bucket,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,6 +54,9 @@ class C:
     USAGE_LINE  = ( 50,  50,  58)
     TEMP_LINE   = (220, 130,  50)
     POWER_LINE  = ( 60, 130, 200)
+    # Greeting-tile text (drawn on top of a photo background).
+    GREET_FG    = (255, 255, 255)   # primary text (white)
+    GREET_DIM   = (220, 220, 228)   # secondary text (dimmer white)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +71,7 @@ class T:
     GRID_UNIT   = 14     # inline unit suffix ("MHz", "RPM") — still smaller + dimmer than value
     HERO_SUB_LBL = 18    # "TEMP", "POWER"
     HERO_SUB_VAL = 24    # "54°", "48W"
-    METRIC_VAL  = 42     # RAM/ROM/FPS big
+    METRIC_VAL  = 42     # RAM/ROM big
     METRIC_LBL  = 17
     CARD_TITLE  = 18     # "NETWORK SPEED", "TIME", "WEATHER"
     NET_VAL     = 30
@@ -77,6 +86,12 @@ class T:
     TAG         = 14     # "ON DEMAND" pill text
     HIST_TITLE  = 11     # history-chart header label
     HIST_DOT    = 11     # history-chart legend dots (font size for spacing)
+    # Greeting-tile typography (sits over a photo background).
+    GREETING     = 30    # "Good evening, Bambaw"
+    GREET_LOC    = 18    # location + condition secondary lines
+    GREET_TEMP   = 84    # big temperature
+    GREET_COND   = 26    # condition text (right side)
+    GREET_HILO   = 18    # hi/lo + feels-like line
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,13 +156,19 @@ def _text_wh(draw, text, font):
 # Card builders
 # ─────────────────────────────────────────────────────────────────────────────
 def draw_section_header(draw: ImageDraw.ImageDraw, y: int, title: str) -> int:
-    """Draw a section header (small caps + horizontal rule). Returns new y."""
+    """Draw a section header (small caps + horizontal rule). Returns new y.
+
+    Returns ``y + 46`` so the gap between the header text bottom and the
+    next card top matches the 16-px gap above the header (where the
+    previous card ends + 16 px). The text itself is ~28 px tall, so this
+    leaves 18 px of padding between the text and the card.
+    """
     font = _font(YAHEI, T.SECTION)
     _text(draw, (24, y), title.upper(), font=font, fill=C.TITLE)
     w, _ = _text_wh(draw, title.upper(), font)
     rule_y = y + 16
     draw.line((24 + w + 12, rule_y, 462 - 24, rule_y), fill=C.DIVIDER, width=1)
-    return y + 38
+    return y + 46
 
 
 def draw_usage_hero(draw, x, y, w, h, big_value: str, label: str, temp_str: str,
@@ -374,8 +395,11 @@ def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str = ""):
 
     # ── Inner plot area ─────────────────────────────────────────────
     pad_l, pad_r = 12, 12
-    # Less header padding when there's no title — gives the plot more room.
-    pad_t = 12 if not label else 28
+    # The legend dots sit in the top ~22 px of the strip — pad_t must clear
+    # them so a maxed-out series can't touch the legend text. 26 gives ~4 px
+    # of breathing room even when font rendering runs slightly taller than
+    # expected.
+    pad_t = 26 if not label else 30
     pad_b = 14         # leave a little breathing room at the bottom
     px = x + pad_l
     py = y + pad_t
@@ -416,7 +440,7 @@ def draw_mixed_history_chart(draw, x, y, w, h, samples, label: str = ""):
 
 
 def draw_metric_card(draw, x, y, w, h, value: str, label: str, pct: float):
-    """Small bottom-row card (RAM / ROM / FPS) with big number + label + bar."""
+    """Small bottom-row card (RAM / ROM) with big number + label + bar."""
     _shadow_rect(draw, (x, y, x + w, y + h), radius=12)
     _round_rect(draw, (x, y, x + w, y + h), radius=12, fill=C.CARD, outline=C.CARD_EDGE)
     val_font = _font(SEGOE, T.METRIC_VAL)
@@ -474,6 +498,215 @@ def draw_clock_icon(draw, cx, cy, r):
     draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=C.VALUE, width=2)
     draw.line((cx, cy, cx, cy - r + 4), fill=C.VALUE, width=2)
     draw.line((cx, cy, cx + r - 7, cy + 2), fill=C.VALUE, width=2)
+
+
+def _apply_gradient_overlay(image: Image.Image, x: int, y: int, w: int, h: int,
+                             max_alpha: int = 90):
+    """Paint a vertical top→bottom dark gradient over (x, y, w, h).
+
+    Ensures the greeting-tile text stays legible across any photo
+    background — even the bright noon images. ``max_alpha`` is the alpha
+    value (0-255) at the bottom of the gradient; the top stays 0 so
+    bright skies in the photos are preserved.
+    """
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    for row in range(h):
+        # Quadratic falloff so the bottom is darker faster — text rows sit
+        # near the bottom of the tile, so a stronger gradient there helps.
+        ratio = row / max(1, h - 1)
+        a = int(max_alpha * ratio * ratio)
+        od.line([(0, row), (w, row)], fill=(0, 0, 0, a))
+    image.paste(overlay, (x, y), overlay)
+
+
+def _make_rounded_mask(w: int, h: int, radius: int) -> Image.Image:
+    """Build a binary rounded-rectangle mask of size (w, h).
+
+    Implemented manually with 4 pieslices + an interior rect because
+    Pillow's ``ImageDraw.rounded_rectangle`` is marked experimental and
+    effectively ignores the ``radius`` argument in some versions (only
+    chamfers a couple of corner pixels). The pieslice + rect combo draws
+    a true quarter-circle at every corner.
+    """
+    r = max(0, min(radius, w // 2, h // 2))
+    mask = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    if r == 0:
+        d.rectangle((0, 0, w - 1, h - 1), fill=255)
+        return mask
+    # Four corner pieslices fill the rounded quadrant at each corner.
+    d.pieslice((0, 0, 2 * r - 1, 2 * r - 1), 180, 270, fill=255)
+    d.pieslice((w - 2 * r, 0, w - 1, 2 * r - 1), 270, 360, fill=255)
+    d.pieslice((0, h - 2 * r, 2 * r - 1, h - 1), 90, 180, fill=255)
+    d.pieslice((w - 2 * r, h - 2 * r, w - 1, h - 1), 0, 90, fill=255)
+    # Interior rectangle (excluding the four corner quadrants).
+    d.rectangle((r, 0, w - r - 1, h - 1), fill=255)
+    d.rectangle((0, r, w - 1, h - r - 1), fill=255)
+    return mask
+
+
+def _paste_rounded(image: Image.Image, source: Image.Image,
+                   x: int, y: int, w: int, h: int, radius: int = 14):
+    """Paste ``source`` into ``image`` at (x, y) clipped to a rounded rect.
+
+    Used for the greeting tile so the photo background matches the rounded
+    card corners of every other tile on the dashboard. Falls back to a
+    plain paste if the source image is the wrong mode for alpha masking.
+    """
+    if source.size != (w, h):
+        resample = getattr(Image.Resampling, "LANCZOS", Image.LANCZOS)
+        source = source.resize((w, h), resample)
+    mask = _make_rounded_mask(w, h, radius)
+    try:
+        image.paste(source, (x, y), mask)
+    except ValueError:
+        # Source has no alpha channel (e.g. "P" or "1" mode) — convert
+        # to RGBA first so the mask has something to clip against.
+        image.paste(source.convert("RGBA"), (x, y), mask)
+
+
+def draw_greeting_tile(image: Image.Image, draw: ImageDraw.ImageDraw,
+                       x: int, y: int, w: int, h: int,
+                       snapshot: SensorSnapshot,
+                       greeting_name: str,
+                       weather_images: Optional[WeatherImages]):
+    """Top-of-dashboard greeting + weather tile.
+
+    Layout (414 × 268, full card width minus side margins) — vertical
+    stack so the big temperature stays the focal point without colliding
+    with the greeting horizontally:
+
+        y+ 22  Good <time>, <name>                              ← greeting (left)
+        y+ 56  • <location>                                     ← location (left, dim)
+        y+ 95
+        y+110  26°                       Mostly Cloudy          ← big temp (left), condition (right of temp)
+        y+194  ↑30° ↓24° • Feels like 30°                       ← hi/lo + feels-like (left)
+
+    Background: weather-state image from ``weather_images`` (falls back to
+    a solid dark-blue if the asset set is missing). Both the photo AND
+    the readability gradient are clipped to a rounded rect so the tile
+    corners match every other card on the dashboard.
+
+    The greeting text + bucket come from the local-time hour; if weather
+    is disabled (``snapshot.weather.available=False``), the temp + hi/lo
+    placeholders still render but show em-dashes.
+    """
+    radius = 14
+    # ── 1. Background image (rounded) ──────────────────────────────────
+    now = datetime.fromtimestamp(snapshot.timestamp)
+    bucket = time_bucket(now)
+    if weather_images is not None and snapshot.weather.available:
+        state = icon_to_state(snapshot.weather.current_icon)
+        bg = weather_images.get(state, bucket)
+    else:
+        # Weather not configured: pick a neutral background (clear + current
+        # bucket so the tile still looks intentional).
+        from .weather import TIME_BUCKETS, _FALLBACK_STATE, _FALLBACK_BUCKET
+        state = _FALLBACK_STATE
+        bucket = bucket if bucket in TIME_BUCKETS else _FALLBACK_BUCKET
+        bg = weather_images.get(state, bucket) if weather_images is not None else None
+
+    if bg is not None:
+        _paste_rounded(image, bg, x, y, w, h, radius=radius)
+
+    # ── 2. Readability overlay (rounded) ───────────────────────────────
+    # Build the gradient as an L-mode alpha mask (the alpha values for how
+    # much black to mix in at each row), then paste solid black with that
+    # mask — Pillow's ``paste`` only does the right thing when the source
+    # is RGB and the mask is L; RGBA-on-L composites oddly.
+    grad_alpha = Image.new("L", (w, h), 0)
+    gd = ImageDraw.Draw(grad_alpha)
+    max_alpha = 110
+    for row in range(h):
+        ratio = row / max(1, h - 1)
+        a = int(max_alpha * ratio * ratio)
+        gd.line([(0, row), (w - 1, row)], fill=a)
+    # Intersect the gradient alpha with the rounded mask so the gradient
+    # doesn't bleed past the card corners.
+    rounded = _make_rounded_mask(w, h, radius)
+    combined = ImageChops.multiply(grad_alpha, rounded)
+    image.paste((0, 0, 0), (x, y), combined)
+
+    # ── 3. Text ─────────────────────────────────────────────────────────
+    greet_font = _font(SEGOE, T.GREETING)
+    loc_font   = _font(SEGOE, T.GREET_LOC)
+    temp_font  = _font(SEGOE, T.GREET_TEMP)
+    cond_font  = _font(SEGOE, T.GREET_COND)
+    hilo_font  = _font(SEGOE, T.GREET_HILO)
+
+    pad_x = 24
+
+    # Greeting (top-left).
+    greet_text = f"{greeting_for_bucket(bucket)}, {greeting_name}"
+    _text(draw, (x + pad_x, y + 22), greet_text,
+          font=greet_font, fill=C.GREET_FG)
+
+    # Location + weather payload.
+    wx = snapshot.weather
+    if wx.available:
+        location = wx.location or "—"
+        temp_str = f"{int(round(wx.current_temp_c))}°"
+        condition = _wx_condition_text(wx.current_icon)
+        # Today's hi/lo from the first forecast entry (label == "Today").
+        hi_lo = "—"
+        for day in wx.forecast:
+            if day.label == "Today":
+                hi_lo = f"↑{int(round(day.high_c))}° ↓{int(round(day.low_c))}°"
+                break
+    else:
+        location = "weather disabled"
+        temp_str = "?°"
+        condition = "—"
+        hi_lo = "—"
+
+    # Location (left, below greeting).
+    _text(draw, (x + pad_x, y + 56),
+          f"\u2022 {location}",  # bullet glyph as a stand-in for a pin icon
+          font=loc_font, fill=C.GREET_DIM)
+
+    # Big temperature (left, dominant). anchor="la" (default) so it grows
+    # rightward but stays clear of the greeting column on the left.
+    _text(draw, (x + pad_x, y + 110), temp_str,
+          font=temp_font, fill=C.GREET_FG)
+
+    # Condition (right of the temp, on the same baseline). Measure the
+    # temp's width so we can offset the condition cleanly without overlap.
+    temp_w, _ = _text_wh(draw, temp_str, temp_font)
+    cond_x = x + pad_x + temp_w + 18
+    _text(draw, (cond_x, y + 134), condition,
+          font=cond_font, fill=C.GREET_FG)
+
+    # Hi/lo + feels-like (bottom-left).
+    feels_like_str = (
+        f"{int(round(wx.current_feels_like_c))}°"
+        if wx.current_feels_like_c > 0
+        else "—"
+    )
+    hilo_text = f"{hi_lo}  \u2022  Feels like {feels_like_str}"
+    _text(draw, (x + pad_x, y + h - 26), hilo_text,
+          font=hilo_font, fill=C.GREET_DIM)
+
+
+# OpenWeatherMap icon prefix → human-readable condition string.
+# Covers the 9 prefixes exposed by OWM; anything else falls back to "".
+_WX_CONDITION_LABELS = {
+    "01": "Clear",
+    "02": "Partly Cloudy",
+    "03": "Cloudy",
+    "04": "Overcast",
+    "09": "Drizzle",
+    "10": "Rain",
+    "11": "Thunderstorms",
+    "13": "Snow",
+    "50": "Fog",
+}
+
+
+def _wx_condition_text(icon_code: str) -> str:
+    """Return a short human label for an OpenWeatherMap icon code."""
+    prefix = icon_code[:2] if icon_code else ""
+    return _WX_CONDITION_LABELS.get(prefix, "—")
 
 
 def draw_weather_icon(draw, cx, cy, r, code: str):
@@ -574,20 +807,31 @@ class Renderer:
         return img, draw
 
     def render(self, snapshot: SensorSnapshot,
-               history: Optional[Any] = None) -> Image.Image:
+               history: Optional[Any] = None,
+               greeting_name: str = "",
+               weather_images: Optional[WeatherImages] = None) -> Image.Image:
         """Draw a full frame and return it as a PIL.Image (RGB).
 
         ``history`` is an optional HistoryBuffer; when provided, its
         CPU/GPU sample lists are drawn into the matching hero cards.
+
+        ``greeting_name`` and ``weather_images`` drive the greeting tile at
+        the top of the dashboard. When ``weather_images`` is None the tile
+        still renders the greeting + dimmed fallback so the layout stays
+        intact even on a fresh install.
         """
         img, draw = self._fresh()
         self.image, self.draw = img, draw
-        self._draw_layout(snapshot, history)
+        self._draw_layout(snapshot, history, greeting_name, weather_images)
         return img
 
-    def _draw_layout(self, snap: SensorSnapshot, history: Optional[Any] = None):
+    def _draw_layout(self, snap: SensorSnapshot, history: Optional[Any] = None,
+                     greeting_name: str = "",
+                     weather_images: Optional[WeatherImages] = None):
         d = self.draw
         assert d is not None
+        img = self.image
+        assert img is not None
 
         # Pull sample lists out of the history buffer (or empty if None).
         cpu_hist = history.cpu_tuples() if history is not None else []
@@ -596,6 +840,9 @@ class Renderer:
         # Two-row stack per section: hero card (with chart strip) on top,
         # misc tiles strip below. Hero gets the favored ~63% of the height
         # so the usage number and history chart both breathe.
+        # Note: section_h below is visual reference only — actual y tracking
+        # is done with explicit positions because the greeting tile shifts
+        # the first CPU header by a non-uniform amount vs the rest.
         section_h = 540
         hero_h = 340
         gap = 16
@@ -603,9 +850,16 @@ class Renderer:
         card_w = self.width - 24 * 2
         left_x = 24
 
-        y = 30
+        # ── Greeting tile (replaces the old bottom-of-screen weather card)
+        # Height trimmed 280 → 268 so the layout still fits after the
+        # header-bottom-padding increase below.
+        greet_h = 268
+        draw_greeting_tile(img, d, left_x, 30, card_w, greet_h,
+                           snap, greeting_name or "friend", weather_images)
+        y = 30 + greet_h + gap  # 314
+
         # ── CPU section ──────────────────────────────────────────────
-        y = draw_section_header(d, y, "CPU STATUS MONITORING")
+        y = draw_section_header(d, y, "CPU STATUS MONITORING")  # y → 360
         draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.cpu.usage_str, "CPU USAGE",
                         snap.cpu.temp_str, snap.cpu.power_str,
@@ -617,10 +871,11 @@ class Renderer:
             ("AIO PUMP",  snap.cpu.pump_str,  "RPM"),
             ("VOLTAGE",   snap.cpu.voltage_str),
         ])
-        y += section_h + 28
+        y = y + hero_h + gap + misc_h + gap  # 916 — explicit step to absorb
+                                             # header-height changes
 
         # ── GPU section ──────────────────────────────────────────────
-        y = draw_section_header(d, y, "GPU STATUS MONITORING")
+        y = draw_section_header(d, y, "GPU STATUS MONITORING")  # y → 962
         draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.gpu.usage_str, "GPU USAGE",
                         snap.gpu.temp_str, snap.gpu.power_str,
@@ -632,40 +887,37 @@ class Renderer:
             ("GPU FAN",    snap.gpu.fan_str,      "RPM"),
             ("VRAM CLOCK", snap.gpu.vram_clock_str, "MHz"),
         ])
-        y += section_h + 28
+        y = y + hero_h + gap + misc_h + gap  # 1518
 
-        # ── Bottom row: 3 mini cards + network + time ─────────────────
-        bottom_h = 180
-        mini_w = (self.width - 24 * 2 - 12 * 2) // 3
+        # ── Bottom row: 2 mini cards (RAM / ROM) + network + time ──────
+        # FPS tile was removed; the freed slot is folded back into RAM + ROM
+        # so each card is wider and the bar/labels breathe.
+        bottom_h = 160
+        mini_w = (self.width - 24 * 2 - 12) // 2
         draw_metric_card(d, left_x, y, mini_w, bottom_h,
                          snap.mem.ram_str, "RAM", snap.mem.ram_percent)
         draw_metric_card(d, left_x + mini_w + 12, y, mini_w, bottom_h,
                          snap.mem.disk_str, "ROM", snap.mem.disk_percent)
-        draw_metric_card(d, left_x + (mini_w + 12) * 2, y, mini_w, bottom_h,
-                         snap.fps.fps_str, "FPS", min(100.0, snap.fps.fps))
-        y += bottom_h + 22
+        y += bottom_h + gap  # 1694
 
-        # Network + Time on a single compact row
+        # Network + Time on a single compact row.
         wide_card_w = (self.width - 24 * 2 - 12) // 2
-        net_h = 180
+        net_h = 160
         draw_network_card(d, left_x, y, wide_card_w, net_h,
                           snap.net.up_str, snap.net.down_str)
         draw_time_card(d, left_x + wide_card_w + 12, y, wide_card_w, net_h,
                        datetime.fromtimestamp(snap.timestamp))
-        y += net_h + 22
+        y += net_h + gap  # 1870
 
-        # ── Weather card (full width) ────────────────────────────────
-        wx_h = 200
-        draw_weather_card(d, 24, y, self.width - 48, wx_h, snap)
-        y += wx_h + 16
-
-        # ── Brand strip / footer (fills bottom) ──────────────────────
-        footer_y = self.height - 70
+        # ── Brand strip / footer (50-px band at bottom) ──────────────
+        # Footer line moved from height-70 → height-50 so the divider no
+        # longer clips the rounded bottom corners of the Net/Time cards.
+        footer_y = self.height - 50  # 1870
         d.line((24, footer_y, self.width - 24, footer_y), fill=C.DIVIDER, width=1)
         brand_font = _font(YAHEI, T.FOOTER)
-        _text(d, (24, footer_y + 18), "TROFEO VISION 9.16\"",
+        _text(d, (24, footer_y + 14), "TROFEO VISION 9.16\"",
               font=brand_font, fill=C.LABEL)
-        _text(d, (self.width - 24, footer_y + 18), "PYTHON  ·  PIL  ·  WINUSB",
+        _text(d, (self.width - 24, footer_y + 14), "PYTHON  ·  PIL  ·  WINUSB",
               font=brand_font, fill=C.LABEL, anchor="ra")
 
     # ─── Output helpers ────────────────────────────────────────────

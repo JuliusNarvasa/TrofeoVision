@@ -35,6 +35,17 @@ class WeatherConfig:
     country: str = "PH"
     units: str = "metric"  # metric | imperial
     refresh_seconds: int = 600  # 10 min cache
+    # Directory holding <state>_<time_bucket>.png backgrounds for the greeting tile.
+    # Default: <repo>/assets/weather/ (resolved at runtime; see weather.py).
+    assets_dir: str = ""
+
+
+@dataclass(frozen=True)
+class GreetingConfig:
+    """User-facing greeting tile configuration."""
+
+    # Name shown after "Good <time of day>, ".
+    name: str = "Bambaw"
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,7 @@ class DisplayConfig:
 class Config:
     usb: UsbConfig = field(default_factory=UsbConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    greeting: GreetingConfig = field(default_factory=GreetingConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
 
     @classmethod
@@ -59,8 +71,9 @@ class Config:
             data = tomllib.load(f)
         usb = UsbConfig(**data.get("usb", {}))
         weather = WeatherConfig(**data.get("weather", {}))
+        greeting = GreetingConfig(**data.get("greeting", {}))
         display = DisplayConfig(**data.get("display", {}))
-        return cls(usb=usb, weather=weather, display=display)
+        return cls(usb=usb, weather=weather, greeting=greeting, display=display)
 
     @classmethod
     def write_default(cls, path: Path | None = None) -> Path:
@@ -80,11 +93,17 @@ sensor_refresh_seconds = 1.0
 
 [weather]
 enabled = false
-api_key = ""        # https://openweathermap.org/api/one-call-3
+# Get a key at https://home.openweathermap.org/api_keys then paste it here
+# and flip ``enabled`` to true.
+api_key = ""
 city = "Manila"
 country = "PH"
 units = "metric"
 refresh_seconds = 600
+# assets_dir = ""   # leave blank to use <repo>/assets/weather/
+
+[greeting]
+name = "Bambaw"     # shown after "Good <morning|noon|afternoon|evening|night>, "
 
 [display]
 width = 462

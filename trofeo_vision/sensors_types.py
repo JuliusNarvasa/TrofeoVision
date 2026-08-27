@@ -134,15 +134,6 @@ class NetStats:
 
 
 @dataclass(frozen=True)
-class FpsStats:
-    fps: float = 0.0
-
-    @property
-    def fps_str(self) -> str:
-        return f"{int(round(self.fps))}" if self.fps > 0 else "0"
-
-
-@dataclass(frozen=True)
 class WeatherDay:
     label: str       # "Today", "Tue", "Wed"
     high_c: float
@@ -155,6 +146,7 @@ class WeatherStats:
     available: bool = False
     location: str = ""
     current_temp_c: float = 0.0
+    current_feels_like_c: float = 0.0
     current_icon: str = ""
     forecast: list[WeatherDay] = field(default_factory=list)
     error: str = ""
@@ -169,5 +161,4 @@ class SensorSnapshot:
     gpu: GpuStats = field(default_factory=GpuStats)
     mem: MemDiskStats = field(default_factory=MemDiskStats)
     net: NetStats = field(default_factory=NetStats)
-    fps: FpsStats = field(default_factory=FpsStats)
     weather: WeatherStats = field(default_factory=WeatherStats)

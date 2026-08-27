@@ -18,7 +18,7 @@ from trofeo_vision.config import Config  # noqa: E402
 from trofeo_vision.history import HistoryBuffer  # noqa: E402
 from trofeo_vision.renderer import Renderer  # noqa: E402
 from trofeo_vision.sensors_types import (  # noqa: E402
-    CpuStats, GpuStats, MemDiskStats, NetStats, FpsStats,
+    CpuStats, GpuStats, MemDiskStats, NetStats,
     SensorSnapshot, WeatherStats,
 )
 
@@ -55,7 +55,6 @@ def make_snap(t: float, jitter: bool = True) -> SensorSnapshot:
         mem=MemDiskStats(ram_percent=42, ram_used_gb=13.5, ram_total_gb=32,
                          disk_percent=58, disk_used_gb=580, disk_total_gb=1000),
         net=NetStats(up_bps=200_000, down_bps=1_500_000),
-        fps=FpsStats(fps=72),
         weather=WeatherStats(available=False, error="weather disabled"),
     )
 

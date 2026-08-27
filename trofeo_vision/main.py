@@ -26,7 +26,7 @@ from .history import HistoryBuffer
 from .renderer import Renderer
 from .sensors import SensorReader
 from .sensors_types import SensorSnapshot, WeatherStats
-from .weather import WeatherClient
+from .weather import WeatherClient, WeatherImages
 
 
 log = logging.getLogger("trofeo_vision")
@@ -66,7 +66,7 @@ def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient) -> Sens
         snap = SensorSnapshot(
             timestamp=snap.timestamp,
             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
-            net=snap.net, fps=snap.fps,
+            net=snap.net,
             weather=weather.get(),
         )
     return snap
@@ -76,6 +76,7 @@ def run_dry(args, cfg: Config) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sensors = SensorReader(interval=cfg.usb.sensor_refresh_seconds, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
+    weather_images = _make_weather_images(cfg)
     history = HistoryBuffer()
     sensors.start()
     try:
@@ -84,7 +85,9 @@ def run_dry(args, cfg: Config) -> int:
             snap = snapshot_with_weather(sensors, weather)
             history.push(snap)
             r = Renderer(cfg.display.width, cfg.display.height)
-            img = r.render(snap, history=history)
+            img = r.render(snap, history=history,
+                           greeting_name=cfg.greeting.name,
+                           weather_images=weather_images)
             png = args.out_dir / "frame.png"
             r.save_png(png)
             log.info("Saved %s (%dx%d)", png, img.width, img.height)
@@ -103,7 +106,9 @@ def run_dry(args, cfg: Config) -> int:
             snap = snapshot_with_weather(sensors, weather)
             history.push(snap)
             r = Renderer(cfg.display.width, cfg.display.height)
-            r.render(snap, history=history)
+            r.render(snap, history=history,
+                     greeting_name=cfg.greeting.name,
+                     weather_images=weather_images)
             r.save_png(args.out_dir / f"frame_{idx:05d}.png")
             idx += 1
             if idx % 20 == 0:
@@ -119,6 +124,7 @@ def run_dry(args, cfg: Config) -> int:
 def run_live(args, cfg: Config) -> int:
     sensors = SensorReader(interval=cfg.usb.sensor_refresh_seconds, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
+    weather_images = _make_weather_images(cfg)
     history = HistoryBuffer()
     renderer = Renderer(cfg.display.width, cfg.display.height)
     driver = Driver(jpeg_quality=cfg.display.jpeg_quality)
@@ -148,7 +154,9 @@ def run_live(args, cfg: Config) -> int:
             time.sleep(0.5)  # let one sensor tick happen
             snap = snapshot_with_weather(sensors, weather)
             history.push(snap)
-            renderer.render(snap, history=history)
+            renderer.render(snap, history=history,
+                            greeting_name=cfg.greeting.name,
+                            weather_images=weather_images)
             # Use driver.encode_jpeg() — rotates for the LCD orientation.
             jpeg = driver.encode_jpeg(renderer.image)
             stats = driver.push_frame(jpeg)
@@ -162,7 +170,9 @@ def run_live(args, cfg: Config) -> int:
         while not stop["flag"]:
             snap = snapshot_with_weather(sensors, weather)
             history.push(snap)
-            renderer.render(snap, history=history)
+            renderer.render(snap, history=history,
+                            greeting_name=cfg.greeting.name,
+                            weather_images=weather_images)
             # Use driver.encode_jpeg() — rotates for the LCD orientation.
             jpeg = driver.encode_jpeg(renderer.image)
             stats = driver.push_frame(jpeg)
@@ -175,6 +185,13 @@ def run_live(args, cfg: Config) -> int:
         driver.close()
         sensors.stop()
     return 0
+
+
+def _make_weather_images(cfg: Config) -> WeatherImages:
+    """Resolve the greeting-tile asset dir from config (with default fallback)."""
+    if cfg.weather.assets_dir:
+        return WeatherImages(Path(cfg.weather.assets_dir))
+    return WeatherImages(WeatherImages.default_assets_dir())
 
 
 def _diagnose(sensors: SensorReader, driver_kind: str = "Driver") -> None:
@@ -213,6 +230,7 @@ def main() -> int:
         cfg = Config(
             usb=cfg.usb,
             weather=cfg.weather,
+            greeting=cfg.greeting,
             display=cfg.display,
         )  # cfg is frozen; rate is applied at runtime
 

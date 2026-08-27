@@ -21,7 +21,7 @@ from trofeo_vision.history import HistoryBuffer  # noqa: E402
 from trofeo_vision.renderer import Renderer  # noqa: E402
 from trofeo_vision.sensors import SensorReader  # noqa: E402
 from trofeo_vision.sensors_types import SensorSnapshot, WeatherStats  # noqa: E402
-from trofeo_vision.weather import WeatherClient  # noqa: E402
+from trofeo_vision.weather import WeatherClient, WeatherImages  # noqa: E402
 
 
 def main() -> int:
@@ -37,6 +37,9 @@ def main() -> int:
     cfg = Config.load()
     sensors = SensorReader(interval=0.5, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
+    assets_dir = (Path(cfg.weather.assets_dir) if cfg.weather.assets_dir
+                  else WeatherImages.default_assets_dir())
+    weather_images = WeatherImages(assets_dir)
     history = HistoryBuffer()
     sensors.start()
     time.sleep(0.3)  # let one tick happen
@@ -50,11 +53,13 @@ def main() -> int:
                 snap = SensorSnapshot(
                     timestamp=snap.timestamp,
                     cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
-                    net=snap.net, fps=snap.fps,
+                    net=snap.net,
                     weather=weather.get(),
                 )
             history.push(snap)
-            renderer.render(snap, history=history)
+            renderer.render(snap, history=history,
+                            greeting_name=cfg.greeting.name,
+                            weather_images=weather_images)
             png_path = args.out / ("frame_latest.png" if not args.loop else f"frame_{idx:05d}.png")
             renderer.save_png(png_path)
             print(f"[{idx:05d}] saved {png_path}")

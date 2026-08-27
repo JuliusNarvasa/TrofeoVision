@@ -4,6 +4,9 @@ Cached in memory for `refresh_seconds`. Disabled by default — needs an API key
 Activate by setting [weather] enabled = true and api_key = "<your key>" in config.toml.
 
 Free tier: https://openweathermap.org/api/one-call-3 (1000 calls/day free).
+
+Also provides `WeatherImages`, a tiny loader for the greeting-tile background
+images under `<repo>/assets/weather/<state>_<bucket>.png`.
 """
 
 from __future__ import annotations
@@ -11,15 +14,168 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import requests
+from PIL import Image
 
 from .config import WeatherConfig
 from .sensors_types import WeatherDay, WeatherStats
 
 
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Greeting-tile background images
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 8 weather states × 5 time-of-day buckets = 40 files, named:
+#     <state>_<bucket>.png  (e.g. "clear_morning.png", "rain_night.png")
+#
+# Bucket bounds (local time, see `time_bucket` below):
+#     morning    5–11   noon      12      afternoon  13–17
+#     evening   18–21   night     22–4   (wraps)
+#
+# All images must be 462×280 to match the greeting tile exactly.
+
+# 8 weather states in canonical order. The mapping from OpenWeatherMap icon
+# codes (e.g. "01d", "10n") to these states lives in `icon_to_state` below.
+WEATHER_STATES = (
+    "clear",
+    "partly_cloudy",
+    "cloudy",
+    "drizzle",
+    "rain",
+    "thunder",
+    "snow",
+    "fog",
+)
+
+TIME_BUCKETS = ("morning", "noon", "afternoon", "evening", "night")
+
+# Map OWM icon prefix → weather state. We keep day/night codes merged so
+# the same image can be reused; the renderer overlays a dark gradient for
+# night buckets anyway.
+_ICON_PREFIX_TO_STATE: dict[str, str] = {
+    "01": "clear",
+    "02": "partly_cloudy",
+    "03": "cloudy",
+    "04": "cloudy",
+    "09": "drizzle",
+    "10": "rain",
+    "11": "thunder",
+    "13": "snow",
+    "50": "fog",
+}
+
+_FALLBACK_STATE = "clear"
+_FALLBACK_BUCKET = "morning"
+
+
+def icon_to_state(icon_code: str) -> str:
+    """Map an OpenWeatherMap icon code (e.g. "01d") to one of WEATHER_STATES."""
+    prefix = icon_code[:2] if icon_code else ""
+    return _ICON_PREFIX_TO_STATE.get(prefix, _FALLBACK_STATE)
+
+
+def time_bucket(dt: datetime) -> str:
+    """Map a local-time datetime to one of TIME_BUCKETS.
+
+        morning    05:00–11:59
+        noon       12:00–12:59   (single hour)
+        afternoon  13:00–17:59
+        evening    18:00–21:59
+        night      22:00–04:59   (wraps midnight)
+    """
+    h = dt.hour
+    if 5 <= h < 12:
+        return "morning"
+    if h == 12:
+        return "noon"
+    if 13 <= h < 18:
+        return "afternoon"
+    if 18 <= h < 22:
+        return "evening"
+    return "night"
+
+
+def greeting_for_bucket(bucket: str) -> str:
+    """The word(s) that prefix the user's name on the greeting tile.
+
+    Night falls back to "Good evening" — common UX convention (apps rarely
+    say "Good night" since it sounds like a farewell).
+    """
+    return {
+        "morning":   "Good morning",
+        "noon":      "Good noon",
+        "afternoon": "Good afternoon",
+        "evening":   "Good evening",
+        "night":     "Good evening",
+    }.get(bucket, "Hello")
+
+
+class WeatherImages:
+    """Lazy loader + cache for greeting-tile background PNGs.
+
+    Resolves (state, bucket) → a PIL.Image by reading `<state>_<bucket>.png`
+    out of `assets_dir`. Missing files fall back to `clear_morning.png`,
+    then to a solid dark-blue placeholder so the renderer never crashes on
+    a partial asset set. All images are kept at their native resolution
+    (the renderer resizes / pastes them as-is onto the 462×280 tile).
+    """
+
+    def __init__(self, assets_dir: Path):
+        self.assets_dir = Path(assets_dir)
+        self._cache: dict[tuple[str, str], Image.Image] = {}
+        # Pre-rendered solid fallback if even clear_morning.png is missing.
+        self._placeholder = Image.new("RGB", (462, 280), (24, 64, 110))
+
+    def get(self, state: str, bucket: str) -> Image.Image:
+        """Return the background image for the given (state, bucket) combo.
+
+        Cache key is the requested combo so we still attempt fresh lookups
+        after a missing-file fallback, but once a real file is loaded we
+        keep reusing it. State is normalized to a known set so an unknown
+        OWM prefix can't poison the cache.
+        """
+        state = state if state in WEATHER_STATES else _FALLBACK_STATE
+        bucket = bucket if bucket in TIME_BUCKETS else _FALLBACK_BUCKET
+        key = (state, bucket)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        path = self.assets_dir / f"{state}_{bucket}.png"
+        if not path.exists():
+            log.warning("Weather image missing: %s — using fallback", path)
+            img = self._load_or_placeholder(_FALLBACK_STATE, _FALLBACK_BUCKET)
+        else:
+            try:
+                img = Image.open(path).convert("RGB")
+            except Exception as e:  # noqa: BLE001
+                log.warning("Weather image unreadable: %s (%s) — using placeholder",
+                            path, e)
+                img = self._placeholder
+        self._cache[key] = img
+        return img
+
+    def _load_or_placeholder(self, state: str, bucket: str) -> Image.Image:
+        """Internal: load a fallback combo, recursing at most once."""
+        path = self.assets_dir / f"{state}_{bucket}.png"
+        if path.exists():
+            try:
+                return Image.open(path).convert("RGB")
+            except Exception:  # noqa: BLE001
+                pass
+        return self._placeholder
+
+    @staticmethod
+    def default_assets_dir() -> Path:
+        """The canonical assets folder: <repo>/assets/weather/."""
+        # config.py lives in <repo>/trofeo_vision/. parents[1] is the repo root.
+        return Path(__file__).resolve().parent.parent / "assets" / "weather"
 
 
 class WeatherClient:
@@ -72,6 +228,7 @@ class WeatherClient:
         main = first.get("main", {})
         weather = first.get("weather", [{}])[0]
         current_temp_c = float(main.get("temp", 0.0))
+        current_feels_like_c = float(main.get("feels_like", 0.0))
         current_icon = weather.get("icon", "")
         # OpenWeatherMap returns °C only when units=metric; we always ask metric.
 
@@ -109,6 +266,7 @@ class WeatherClient:
             available=True,
             location=city,
             current_temp_c=current_temp_c,
+            current_feels_like_c=current_feels_like_c,
             current_icon=current_icon,
             forecast=days,
         )

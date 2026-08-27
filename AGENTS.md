@@ -41,37 +41,94 @@ to replace the driver with WinUSB for VID `0416` PID `5408`.
 
 ## LAYOUT (offline renderer — current state)
 
-2-row stack per section (hero on top, misc strip below). Hero card is
-full width (414 px) so the usage chart strip is ~2× wider than the old
-side-by-side layout — gives the line plot real horizontal room.
+Top of the dashboard is a **greeting tile** (full-width 414×280) that
+combines a personalized greeting with the live weather. Every other
+section shifts down accordingly.
 
 ```
 y=  0
-y= 30 [CPU STATUS MONITORING]                              ← header
-y= 68 [Hero card (full width, 414×340):
+y= 30 [Greeting tile (414×280):
+y=    |   Good <time>, <name>             ← greeting, time-of-day based
+y=    |   • <location>                    ← OWM city
+y=    |   26°           Mostly Cloudy     ← big temp + condition
+y=    |   ↑30° ↓24° • Feels like —       ← today's hi/lo (em-dash = no data)
+y=    |   (background = <state>_<bucket>.png from assets/weather/) ]
+y=310
+y=326 [CPU STATUS MONITORING]
+y=364 [Hero card (full width, 414×340):
 y=    |  [TAG]                  TEMP 62°
 y=    |   47% CPU USAGE         POWER 78W
 y=    |  ┌── history chart strip (USE/TEMP/PWR, no header) ──┐
 y=    |  │                                                  │
 y=    |  └──────────────────────────────────────────────────┘ ]
-y=408 [Misc card (ONE big card, 4 cells with vertical dividers):
+y=720 [Misc card (ONE big card, 4 cells with vertical dividers):
 y=    |  CPU FAN  │ CPU CLOCK │ AIO PUMP  │ VOLTAGE         ]
-y=568 [GPU STATUS MONITORING]
-y=606 [Hero card (full width) — same structure as CPU  ]
-y=946 [Misc card: VRAM │ GPU CLOCK │ GPU FAN │ VOLTAGE ]
-y=1148 [RAM 34%] [ROM 56%] [FPS 0]                          ← 3 mini cards
-y=1328 [NETWORK SPEED          ] [TIME              ]
-y=1526 [WeatherFlow (disabled)                     ]
-y=1860 [TROFEO VISION 9.16"  ·  CUSTOM DASHBOARD  PYTHON  ·  PIL  ·  WINUSB]
+y=920 [GPU STATUS MONITORING]
+y=958 [Hero card (full width) — same structure as CPU  ]
+y=1314 [Misc card: VRAM │ GPU CLOCK │ GPU FAN │ VRAM CLOCK]
+y=1514 [RAM 34%      ] [ROM 56%      ]                  ← 2 wider mini cards (FPS tile removed)
+y=1690 [NETWORK SPEED          ] [TIME              ]
+y=1850 [TROFEO VISION 9.16"  ·  CUSTOM DASHBOARD  PYTHON  ·  PIL  ·  WINUSB]
 ```
 
 **Section split:** `section_h=540`, `hero_h=340` (favored ~63%),
 `gap=16`, `misc_h=184`. Chart strip sits in the bottom of the hero card
 at `y+180`, height = `hero_h - 180 - 20` = `140 px`, width `374 px`.
+`bottom_h` (RAM/ROM + Net/Time rows) trimmed from 180 → **160** to
+make room for the greeting tile at the top; everything still fits inside
+the 70-px footer band ending at `y=1920`.
 
 **History:** ring buffer holds 120 samples at 1 Hz (2 minutes). The
 chart legend (USE/TEMP/PWR dots) is the only chart header — no
 seconds-counter title.
+
+---
+
+## GREETING TILE
+
+Top-of-dashboard banner that **replaces** the old bottom weather card.
+Combines the time-of-day greeting with the live weather, drawn over a
+weather-state background image.
+
+**Greeting mapping** (`time_bucket` in `weather.py`, all local time):
+| Hour | Bucket | Greeting |
+|---|---|---|
+| 05–11 | `morning` | "Good morning, <name>" |
+| 12 | `noon` | "Good noon, <name>" |
+| 13–17 | `afternoon` | "Good afternoon, <name>" |
+| 18–21 | `evening` | "Good evening, <name>" |
+| 22–04 | `night` | "Good evening, <name>" (intentional fallback — apps rarely say "Good night") |
+
+**Background images:** `<repo>/assets/weather/<state>_<bucket>.png`,
+40 files = 8 weather states × 5 time buckets. All assets are **462×280 px**
+PNG with the weather motif full-bleed; the renderer pastes them at native
+size onto the 414×280 tile (3-px crop on each side) and overlays a
+quadratic top→bottom dark gradient (`max_alpha=110/255`) for text
+readability. State routing lives in `icon_to_state()` in `weather.py`.
+
+| OWM prefix | State | OWM prefix | State |
+|---|---|---|---|
+| `01` | clear | `09` | drizzle |
+| `02` | partly_cloudy | `10` | rain |
+| `03`, `04` | cloudy | `11` | thunder |
+| `13` | snow | `50` | fog |
+
+**Configurable fields** (in `trofeo_vision/config.toml`):
+```toml
+[greeting]
+name = "Bambaw"           # shown after "Good <time of day>, "
+
+[weather]
+enabled = true
+api_key = "..."           # https://home.openweathermap.org/api_keys
+# assets_dir = ""         # blank → <repo>/assets/weather/ (default)
+```
+
+**Disabled-weather fallback:** if `weather.enabled=false` or the fetch
+fails, the tile still renders — greeting is real, location shows
+"weather disabled", temp shows "?°", condition + hi/lo show "—". The
+clear_morning background is used so the disabled state looks
+intentional, not broken.
 
 ---
 
@@ -124,7 +181,7 @@ After all chunks, read 512 bytes ACK from EP 0x81.
 | CPU voltage (SVI2 TFN) | LibreHardwareMonitor | ✅ live (no admin needed) |
 | CPU temp / power / clock | LibreHardwareMonitor | ✅ as admin (non-admin stays at 0) |
 | CPU fan / AIO pump RPM | LibreHardwareMonitor (PawnIO) | ✅ as admin on B550M Pro4 |
-| Weather | OpenWeatherMap | ✅ stub, needs API key |
+| Weather | OpenWeatherMap | ✅ live — drives the greeting tile (location, temp, condition, today's hi/lo, feels-like). Set `[weather] enabled = true` + `api_key` in config.toml. |
 
 **LHM DLL:** `trofeo_vision/LibreHardwareMonitorLib.dll` is FanControl's
 build (`v0.9.6+2647e1bd`), not upstream LHM — the upstream Windows build
@@ -208,4 +265,3 @@ python scripts/render_offline.py --loop --rate 1 --no-lhm
 4. **JPEG decoder is baseline only** — no progressive, must use `quality=85, subsampling=0`
 5. **Display blanks when frames stop** — must push continuously, not just one frame
 6. **psutil.cpu_percent per-CPU values** — we report overall %, not per-core
-7. **No FPS source** — currently hardcoded to 0; wire up PresentMon or RTSS later
