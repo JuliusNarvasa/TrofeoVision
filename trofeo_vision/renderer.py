@@ -13,6 +13,7 @@ Design notes:
 from __future__ import annotations
 
 import io
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,32 +32,199 @@ from .weather import (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Color palette — kept monochrome on purpose, matches the reference image.
+# Color palette — swappable via set_theme() at the start of each frame.
+# Defaults to LIGHT so renderers that don't pass a ThemeConfig still produce
+# the original look.
 # ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Theme:
+    """All color slots used by the renderer.
+
+    Two presets are provided: ``Theme.light()`` (default — matches the
+    reference image) and ``Theme.dark()`` (low-light friendly). Pass a
+    ``Theme`` to ``set_theme()`` once per frame to swap the active palette;
+    the rest of the renderer reads from the ``C`` class as before.
+    """
+
+    name: str
+    bg: tuple          # page background
+    card: tuple        # card surface
+    card_edge: tuple   # card border
+    shadow: tuple      # drop-shadow tint under cards
+    divider: tuple     # horizontal rules + cross-dividers in misc strip
+    title: tuple       # section / card headers
+    label: tuple       # field labels (medium emphasis)
+    value: tuple       # primary values
+    value_dim: tuple   # secondary values
+    bar_bg: tuple
+    bar_fill: tuple
+    tag_bg: tuple      # "ON DEMAND" pill background
+    tag_fg: tuple      # pill text
+    accent: tuple      # reserved for tiny highlights
+    time_fg: tuple     # clock glyph stroke in TIME card
+    # History-chart series colors.
+    usage_line: tuple
+    temp_line: tuple
+    power_line: tuple
+    # Greeting-tile text (drawn on top of a photo background — same in both
+    # themes; the readability gradient overlay is what makes text legible).
+    greet_fg: tuple
+    greet_dim: tuple
+
+    @classmethod
+    def light(cls) -> "Theme":
+        """The original monochrome light palette (matches the reference image)."""
+        return cls(
+            name="light",
+            bg=(240, 240, 244),
+            card=(255, 255, 255),
+            card_edge=(228, 228, 232),
+            shadow=(220, 220, 225),
+            divider=(235, 235, 240),
+            title=(24, 24, 28),
+            label=(130, 130, 138),
+            value=(30, 30, 34),
+            value_dim=(90, 90, 98),
+            bar_bg=(235, 235, 240),
+            bar_fill=(60, 60, 68),
+            tag_bg=(28, 28, 32),
+            tag_fg=(255, 255, 255),
+            accent=(30, 144, 255),
+            time_fg=(28, 28, 28),
+            usage_line=(50, 50, 58),
+            temp_line=(220, 130, 50),
+            power_line=(60, 130, 200),
+            greet_fg=(255, 255, 255),
+            greet_dim=(220, 220, 228),
+        )
+
+    @classmethod
+    def dark(cls) -> "Theme":
+        """Low-light friendly palette. Designed for an OLED-style dark surface
+        with inverted pill (bright bg + dark text) so the "ON DEMAND" tag
+        still pops against the now-dark card surface.
+        """
+        return cls(
+            name="dark",
+            bg=(18, 18, 22),
+            card=(32, 32, 38),
+            card_edge=(60, 60, 70),
+            shadow=(0, 0, 0),           # invisible on dark bg — that's fine
+            divider=(55, 55, 65),
+            title=(240, 240, 248),
+            label=(155, 155, 165),
+            value=(245, 245, 250),
+            value_dim=(170, 170, 180),
+            bar_bg=(50, 50, 60),
+            bar_fill=(220, 220, 230),
+            tag_bg=(240, 240, 248),     # inverted: bright pill on dark card
+            tag_fg=(24, 24, 28),
+            accent=(30, 144, 255),
+            time_fg=(245, 245, 250),
+            usage_line=(220, 220, 230), # inverted from dark gray to light gray
+            temp_line=(240, 160, 80),   # slightly brighter orange for dark bg
+            power_line=(100, 170, 230), # slightly brighter blue for dark bg
+            greet_fg=(255, 255, 255),
+            greet_dim=(220, 220, 228),
+        )
+
+
 class C:
-    BG          = (240, 240, 244)   # page background (light gray)
-    CARD        = (255, 255, 255)   # card surface
-    CARD_EDGE   = (228, 228, 232)   # card border (very light)
-    SHADOW      = (220, 220, 225)   # soft shadow tint
+    """Color slots read by every drawing helper.
+
+    Treated as a swappable singleton — ``set_theme()`` overwrites these
+    class attributes at the start of each frame. Keeping the read sites
+    pointed at ``C.XXX`` (instead of threading a Theme parameter through
+    every helper) means existing call sites don't change.
+    """
+    BG          = (240, 240, 244)
+    CARD        = (255, 255, 255)
+    CARD_EDGE   = (228, 228, 232)
+    SHADOW      = (220, 220, 225)
     DIVIDER     = (235, 235, 240)
-    TITLE       = ( 24,  24,  28)   # section headers (near-black)
-    LABEL       = (130, 130, 138)   # field labels (medium gray)
-    VALUE       = ( 30,  30,  34)   # primary values (dark)
-    VALUE_DIM   = ( 90,  90,  98)   # secondary values
+    TITLE       = ( 24,  24,  28)
+    LABEL       = (130, 130, 138)
+    VALUE       = ( 30,  30,  34)
+    VALUE_DIM   = ( 90,  90,  98)
     BAR_BG      = (235, 235, 240)
     BAR_FILL    = ( 60,  60,  68)
     TAG_BG      = ( 28,  28,  32)
     TAG_FG      = (255, 255, 255)
-    ACCENT      = ( 30, 144, 255)   # only used for tiny highlights
-    TIME_FG     = ( 28,  28,  32)
-    # History-chart series colors — kept subtle to preserve the monochrome feel.
-    # Usage keeps the dark BAR_FILL tone. Temp is warm (heat), power is cool (watts).
+    ACCENT      = ( 30, 144, 255)
+    TIME_FG     = ( 28,  28,  28)
     USAGE_LINE  = ( 50,  50,  58)
     TEMP_LINE   = (220, 130,  50)
     POWER_LINE  = ( 60, 130, 200)
-    # Greeting-tile text (drawn on top of a photo background).
-    GREET_FG    = (255, 255, 255)   # primary text (white)
-    GREET_DIM   = (220, 220, 228)   # secondary text (dimmer white)
+    GREET_FG    = (255, 255, 255)
+    GREET_DIM   = (220, 220, 228)
+
+
+def set_theme(theme: Theme) -> None:
+    """Swap the active palette. Call once at the start of each frame.
+
+    All drawing helpers read from the ``C`` class, so this single call
+    changes the look of every subsequent draw within the frame.
+    """
+    C.BG         = theme.bg
+    C.CARD       = theme.card
+    C.CARD_EDGE  = theme.card_edge
+    C.SHADOW     = theme.shadow
+    C.DIVIDER    = theme.divider
+    C.TITLE      = theme.title
+    C.LABEL      = theme.label
+    C.VALUE      = theme.value
+    C.VALUE_DIM  = theme.value_dim
+    C.BAR_BG     = theme.bar_bg
+    C.BAR_FILL   = theme.bar_fill
+    C.TAG_BG     = theme.tag_bg
+    C.TAG_FG     = theme.tag_fg
+    C.ACCENT     = theme.accent
+    C.TIME_FG    = theme.time_fg
+    C.USAGE_LINE = theme.usage_line
+    C.TEMP_LINE  = theme.temp_line
+    C.POWER_LINE = theme.power_line
+    C.GREET_FG   = theme.greet_fg
+    C.GREET_DIM  = theme.greet_dim
+
+
+def should_use_dark_theme(hour: int, *, dark_start: int, dark_end: int) -> bool:
+    """Whether the given local hour falls inside the dark-mode window.
+
+    Handles a midnight-wrapping window (e.g. dark 18-6 means 18:00–05:59)
+    as well as a non-wrapping one (e.g. dark 20-23 means 20:00–22:59).
+    If ``dark_start == dark_end`` the window is treated as disabled (always
+    light) so a misconfigured value doesn't make the whole day dark.
+    """
+    if dark_start == dark_end:
+        return False
+    if dark_start < dark_end:
+        return dark_start <= hour < dark_end
+    # dark_start > dark_end → wraps midnight
+    return hour >= dark_start or hour < dark_end
+
+
+def resolve_theme(theme_cfg: Any, dt: Optional[datetime] = None) -> Theme:
+    """Pick the active Theme from a ThemeConfig (or None for default light).
+
+    ``mode`` is "auto" (time-based), "light", or "dark". When "auto", the
+    current local hour is checked against ``dark_start_hour`` /
+    ``dark_end_hour`` (which may wrap midnight, e.g. 18-6).
+    """
+    if theme_cfg is None:
+        return Theme.light()
+    mode = getattr(theme_cfg, "mode", "auto")
+    if mode == "dark":
+        return Theme.dark()
+    if mode == "light":
+        return Theme.light()
+    # auto
+    when = dt if dt is not None else datetime.now()
+    dark = should_use_dark_theme(
+        when.hour,
+        dark_start=int(getattr(theme_cfg, "dark_start_hour", 18)),
+        dark_end=int(getattr(theme_cfg, "dark_end_hour", 6)),
+    )
+    return Theme.dark() if dark else Theme.light()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,13 +645,22 @@ def draw_time_card(draw, x, y, w, h, now: datetime):
     date_font = _font(SEGOE, T.TIME_LBL)
 
     _text(draw, (x + 18, y + 16), "TIME", font=title_font, fill=C.TITLE)
-    # Draw a small clock icon (circle + hour/minute hands) at top-right.
+    # Draw a small clock icon whose hands reflect the current time.
+    # No second hand — at ~4 FPS the second tick would just stutter, and the
+    # card's own time text doesn't show seconds.
     cx, cy, r = x + w - 36, y + 38, 18
     draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=C.TIME_FG, width=2)
-    # minute hand (up)
-    draw.line((cx, cy, cx, cy - r + 5), fill=C.TIME_FG, width=2)
-    # hour hand (slight right)
-    draw.line((cx, cy, cx + r - 8, cy + 3), fill=C.TIME_FG, width=2)
+    minute_angle = (now.minute + now.second / 60.0) * 6.0           # 0° = 12, cw
+    hour_angle = (now.hour % 12 + now.minute / 60.0) * 30.0         # 0° = 12, cw
+    # 12 o'clock = "up" on screen (y increases downward) → subtract 90°.
+    m_rad = math.radians(minute_angle - 90.0)
+    h_rad = math.radians(hour_angle - 90.0)
+    # minute hand (longer, thinner): from center → 80% of radius.
+    draw.line((cx, cy, cx + (r - 4) * math.cos(m_rad),
+               cy + (r - 4) * math.sin(m_rad)), fill=C.TIME_FG, width=2)
+    # hour hand (shorter): from center → 55% of radius.
+    draw.line((cx, cy, cx + (r - 8) * math.cos(h_rad),
+               cy + (r - 8) * math.sin(h_rad)), fill=C.TIME_FG, width=2)
     # 12-hour with AM/PM, no leading zero on hour ("6:15 PM").
     time_str = now.strftime("%I:%M %p").lstrip("0")
     _text(draw, (x + 18, y + 54), time_str, font=time_font, fill=C.VALUE)
@@ -809,7 +986,9 @@ class Renderer:
     def render(self, snapshot: SensorSnapshot,
                history: Optional[Any] = None,
                greeting_name: str = "",
-               weather_images: Optional[WeatherImages] = None) -> Image.Image:
+               weather_images: Optional[WeatherImages] = None,
+               theme_cfg: Optional[Any] = None,
+               now: Optional[datetime] = None) -> Image.Image:
         """Draw a full frame and return it as a PIL.Image (RGB).
 
         ``history`` is an optional HistoryBuffer; when provided, its
@@ -819,7 +998,17 @@ class Renderer:
         the top of the dashboard. When ``weather_images`` is None the tile
         still renders the greeting + dimmed fallback so the layout stays
         intact even on a fresh install.
+
+        ``theme_cfg`` is an optional ThemeConfig (see ``config.py``). When
+        ``None`` the renderer falls back to light mode for backwards
+        compatibility. ``now`` overrides the time used by ``theme_cfg``
+        in auto mode (defaults to ``datetime.now()``); useful for tests
+        and for forcing a snapshot of "night" during the day.
         """
+        # Pick + activate the palette for this frame. Must happen before
+        # _fresh() so the page background already matches the active theme.
+        set_theme(resolve_theme(theme_cfg, now))
+
         img, draw = self._fresh()
         self.image, self.draw = img, draw
         self._draw_layout(snapshot, history, greeting_name, weather_images)
@@ -858,8 +1047,12 @@ class Renderer:
                            snap, greeting_name or "friend", weather_images)
         y = 30 + greet_h + gap  # 314
 
-        # ── CPU section ──────────────────────────────────────────────
-        y = draw_section_header(d, y, "CPU STATUS MONITORING")  # y → 360
+# ── CPU section ──────────────────────────────────────────────
+        # Section header shows the actual CPU model name when known
+        # (LHM or registry fallback), otherwise "CPU" so the layout still
+        # reads cleanly when running with --no-lhm and no registry hit.
+        cpu_title = snap.cpu.name or "CPU"
+        y = draw_section_header(d, y, cpu_title)  # y → 360
         draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.cpu.usage_str, "CPU USAGE",
                         snap.cpu.temp_str, snap.cpu.power_str,
@@ -872,10 +1065,11 @@ class Renderer:
             ("VOLTAGE",   snap.cpu.voltage_str),
         ])
         y = y + hero_h + gap + misc_h + gap  # 916 — explicit step to absorb
-                                             # header-height changes
+                                              # header-height changes
 
         # ── GPU section ──────────────────────────────────────────────
-        y = draw_section_header(d, y, "GPU STATUS MONITORING")  # y → 962
+        gpu_title = snap.gpu.name or "GPU"
+        y = draw_section_header(d, y, gpu_title)  # y → 962
         draw_usage_hero(d, left_x, y, card_w, hero_h,
                         snap.gpu.usage_str, "GPU USAGE",
                         snap.gpu.temp_str, snap.gpu.power_str,

@@ -56,11 +56,33 @@ class DisplayConfig:
 
 
 @dataclass(frozen=True)
+class ThemeConfig:
+    """Color theme for the dashboard.
+
+    ``mode`` is one of:
+        "auto"  - follow ``dark_start_hour`` / ``dark_end_hour`` using local
+                  time (default; dark 18:00-06:00 by default).
+        "light" - always light mode (the original look).
+        "dark"  - always dark mode.
+
+    The auto window can wrap midnight: with ``dark_start_hour=18`` and
+    ``dark_end_hour=6``, dark mode is active from 18:00 through 05:59 and
+    light mode from 06:00 through 17:59. A non-wrapping window (e.g.
+    ``dark_start_hour=20, dark_end_hour=23``) is also supported.
+    """
+
+    mode: str = "auto"
+    dark_start_hour: int = 18
+    dark_end_hour: int = 6
+
+
+@dataclass(frozen=True)
 class Config:
     usb: UsbConfig = field(default_factory=UsbConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
     greeting: GreetingConfig = field(default_factory=GreetingConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    theme: ThemeConfig = field(default_factory=ThemeConfig)
 
     @classmethod
     def load(cls) -> "Config":
@@ -73,7 +95,9 @@ class Config:
         weather = WeatherConfig(**data.get("weather", {}))
         greeting = GreetingConfig(**data.get("greeting", {}))
         display = DisplayConfig(**data.get("display", {}))
-        return cls(usb=usb, weather=weather, greeting=greeting, display=display)
+        theme = ThemeConfig(**data.get("theme", {}))
+        return cls(usb=usb, weather=weather, greeting=greeting,
+                   display=display, theme=theme)
 
     @classmethod
     def write_default(cls, path: Path | None = None) -> Path:
@@ -95,8 +119,8 @@ sensor_refresh_seconds = 1.0
 enabled = false
 # Get a key at https://home.openweathermap.org/api_keys then paste it here
 # and flip ``enabled`` to true.
-api_key = ""
-city = "Manila"
+api_key = "ed7a1951eca9ad8594c294de15e2b03f"
+city = "Davao"
 country = "PH"
 units = "metric"
 refresh_seconds = 600
@@ -109,6 +133,16 @@ name = "Bambaw"     # shown after "Good <morning|noon|afternoon|evening|night>, 
 width = 462
 height = 1920
 jpeg_quality = 85
+
+[theme]
+# "auto" switches between light + dark based on local time (below).
+# "light" or "dark" forces a single mode.
+mode = "auto"
+# When mode = "auto", dark theme is active from dark_start_hour (inclusive)
+# through dark_end_hour (exclusive). The window may wrap midnight: defaults
+# of 18-6 mean dark from 18:00 to 05:59 and light from 06:00 to 17:59.
+dark_start_hour = 18
+dark_end_hour = 6
 """,
             encoding="utf-8",
         )

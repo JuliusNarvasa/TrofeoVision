@@ -1,16 +1,20 @@
 @echo off
 REM ============================================================
-REM Trofeo Vision Dashboard launcher
-REM Kills TRCC and starts the live Python dashboard.
-REM Ctrl+C in this window stops the dashboard (LCD will go blank).
+REM Trofeo Vision Dashboard launcher — TRAY MODE (no console).
+REM
+REM Kills TRCC, then spawns the dashboard as a background process
+REM with a system tray icon. No console window appears — right-click
+REM the tray icon (it lives next to the clock) to pause/resume, open
+REM the log folder, or quit.
+REM
+REM Logs: <repo>\logs\trofeo_vision.log
 REM ============================================================
 
-REM Anchor to this script's directory regardless of where it's invoked from.
 setlocal
 pushd "%~dp0"
 
 echo.
-echo === Trofeo Vision Dashboard ===
+echo === Trofeo Vision Dashboard (tray mode) ===
 echo.
 
 REM Kill any leftover TRCC and stale Python processes that might hold the USB device.
@@ -21,26 +25,18 @@ taskkill /F /IM python.exe /FI "MEMUSAGE gt 50000" >nul 2>&1
 REM Give Windows a moment to release the USB device.
 timeout /t 1 /nobreak >nul
 
-echo [2/2] Starting dashboard at 4 fps (verbose)...
+echo [2/2] Launching tray icon in background...
 echo.
-echo Close this window (or press Ctrl+C) to stop the dashboard.
-echo Restart TRCC afterward via the Start Menu if you want it back.
+echo The dashboard is now running in the background.
+echo Look for the TrofeoVision icon in the system tray (^⇧ next to the clock).
+echo Right-click it for Pause / Resume / Quit.
+echo Logs: %~dp0logs\trofeo_vision.log
 echo.
 
-REM Run the dashboard with --diagnose to print LHM status + USB state,
-REM then --rate 4 for the actual push. If something is broken the diagnostic
-REM output will show it before the live loop starts.
-"C:\Program Files\Python314\python.exe" -m trofeo_vision.main --rate 4 --diagnose
-
-REM If we get here, the script exited. Show any error and pause so the window doesn't vanish.
-echo.
-if %ERRORLEVEL% neq 0 (
-    echo Dashboard exited with error code %ERRORLEVEL%.
-) else (
-    echo Dashboard stopped cleanly.
-)
-echo.
-pause
+REM Launch detached. ``start ""`` with no /B closes this console window
+REM once pythonw.exe takes over. pythonw.exe itself opens no console,
+REM so the dashboard runs purely in the background.
+start "" "C:\Program Files\Python314\pythonw.exe" "%~dp0scripts\run_tray.py" --rate 4
 
 popd
 endlocal

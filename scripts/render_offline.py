@@ -1,9 +1,11 @@
 """Render one frame to PNG/JPEG without touching USB. Quick visual check.
 
 Usage:
-    python scripts/render_offline.py                    # one frame
+    python scripts/render_offline.py                    # one frame (theme from config)
     python scripts/render_offline.py --loop             # 1 fps forever, save frames
     python scripts/render_offline.py --loop --rate 0.5  # 1 frame every 2s
+    python scripts/render_offline.py --theme dark       # force dark theme (testing)
+    python scripts/render_offline.py --theme light      # force light theme (testing)
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from trofeo_vision.config import Config  # noqa: E402
+from trofeo_vision.config import Config, ThemeConfig  # noqa: E402
 from trofeo_vision.history import HistoryBuffer  # noqa: E402
 from trofeo_vision.renderer import Renderer  # noqa: E402
 from trofeo_vision.sensors import SensorReader  # noqa: E402
@@ -31,10 +33,21 @@ def main() -> int:
     p.add_argument("--no-lhm", action="store_true")
     p.add_argument("--save-jpeg", action="store_true")
     p.add_argument("--out", type=Path, default=ROOT / "output")
+    p.add_argument("--theme", choices=("auto", "light", "dark"),
+                   help="Override theme mode from config (default: use config).")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     cfg = Config.load()
+    # Apply CLI theme override on top of the loaded config.
+    if args.theme:
+        cfg = Config(
+            usb=cfg.usb, weather=cfg.weather, greeting=cfg.greeting,
+            display=cfg.display,
+            theme=ThemeConfig(mode=args.theme,
+                              dark_start_hour=cfg.theme.dark_start_hour,
+                              dark_end_hour=cfg.theme.dark_end_hour),
+        )
     sensors = SensorReader(interval=0.5, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
     assets_dir = (Path(cfg.weather.assets_dir) if cfg.weather.assets_dir
@@ -59,7 +72,8 @@ def main() -> int:
             history.push(snap)
             renderer.render(snap, history=history,
                             greeting_name=cfg.greeting.name,
-                            weather_images=weather_images)
+                            weather_images=weather_images,
+                            theme_cfg=cfg.theme)
             png_path = args.out / ("frame_latest.png" if not args.loop else f"frame_{idx:05d}.png")
             renderer.save_png(png_path)
             print(f"[{idx:05d}] saved {png_path}")

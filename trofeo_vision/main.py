@@ -87,7 +87,8 @@ def run_dry(args, cfg: Config) -> int:
             r = Renderer(cfg.display.width, cfg.display.height)
             img = r.render(snap, history=history,
                            greeting_name=cfg.greeting.name,
-                           weather_images=weather_images)
+                           weather_images=weather_images,
+                           theme_cfg=cfg.theme)
             png = args.out_dir / "frame.png"
             r.save_png(png)
             log.info("Saved %s (%dx%d)", png, img.width, img.height)
@@ -108,7 +109,8 @@ def run_dry(args, cfg: Config) -> int:
             r = Renderer(cfg.display.width, cfg.display.height)
             r.render(snap, history=history,
                      greeting_name=cfg.greeting.name,
-                     weather_images=weather_images)
+                     weather_images=weather_images,
+                     theme_cfg=cfg.theme)
             r.save_png(args.out_dir / f"frame_{idx:05d}.png")
             idx += 1
             if idx % 20 == 0:
@@ -156,7 +158,8 @@ def run_live(args, cfg: Config) -> int:
             history.push(snap)
             renderer.render(snap, history=history,
                             greeting_name=cfg.greeting.name,
-                            weather_images=weather_images)
+                            weather_images=weather_images,
+                            theme_cfg=cfg.theme)
             # Use driver.encode_jpeg() — rotates for the LCD orientation.
             jpeg = driver.encode_jpeg(renderer.image)
             stats = driver.push_frame(jpeg)
@@ -166,18 +169,41 @@ def run_live(args, cfg: Config) -> int:
 
         rate = args.rate or cfg.usb.target_fps
         sleep_s = 1.0 / max(0.1, rate)
+        reconnect_backoff_s = 2.0
         log.info("Pushing frames at %.1f fps", rate)
         while not stop["flag"]:
-            snap = snapshot_with_weather(sensors, weather)
-            history.push(snap)
-            renderer.render(snap, history=history,
-                            greeting_name=cfg.greeting.name,
-                            weather_images=weather_images)
-            # Use driver.encode_jpeg() — rotates for the LCD orientation.
-            jpeg = driver.encode_jpeg(renderer.image)
-            stats = driver.push_frame(jpeg)
-            log.debug("Frame sent: %d chunks, %d bytes, %.1f ms",
-                      stats.chunks, stats.bytes, stats.duration_ms)
+            try:
+                snap = snapshot_with_weather(sensors, weather)
+                history.push(snap)
+                renderer.render(snap, history=history,
+                                greeting_name=cfg.greeting.name,
+                                weather_images=weather_images,
+                                theme_cfg=cfg.theme)
+                # Use driver.encode_jpeg() — rotates for the LCD orientation.
+                jpeg = driver.encode_jpeg(renderer.image)
+                stats = driver.push_frame(jpeg)
+                log.debug("Frame sent: %d chunks, %d bytes, %.1f ms",
+                          stats.chunks, stats.bytes, stats.duration_ms)
+            except DriverError as e:
+                # USB went bad mid-loop — typical after the PC sleeps and
+                # the device detaches. Close + retry open() until the
+                # device comes back, instead of dying.
+                log.warning("USB push failed (%s) — reconnecting", e)
+                try:
+                    driver.close()
+                except Exception:
+                    log.exception("Error closing driver during reconnect")
+                while not stop["flag"]:
+                    time.sleep(reconnect_backoff_s)
+                    if stop["flag"]:
+                        break
+                    try:
+                        driver.open()
+                        log.info("USB reconnected — resuming push")
+                        break
+                    except DriverError as e2:
+                        log.info("USB still unavailable (%s) — retrying", e2)
+                continue
             time.sleep(sleep_s)
     except KeyboardInterrupt:
         pass
@@ -232,6 +258,7 @@ def main() -> int:
             weather=cfg.weather,
             greeting=cfg.greeting,
             display=cfg.display,
+            theme=cfg.theme,
         )  # cfg is frozen; rate is applied at runtime
 
     if args.dry_run:

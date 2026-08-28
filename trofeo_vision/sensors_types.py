@@ -20,6 +20,7 @@ class CpuStats:
     clock_mhz: float = 0.0              # current clock MHz
     pump_rpm: float = 0.0               # AIO pump RPM
     voltage_v: float = 0.0              # VCore voltage V
+    name: str = ""                       # marketing name, e.g. "AMD Ryzen 5 5600X"
 
     @property
     def usage_str(self) -> str:   return f"{int(round(self.usage_percent))}%"
@@ -55,6 +56,7 @@ class GpuStats:
     vram_used_mb: float = 0.0
     vram_total_mb: float = 0.0
     voltage_v: float = 0.0
+    name: str = ""                       # marketing name, e.g. "AMD Radeon RX 7800 XT"
 
     @property
     def usage_str(self) -> str:   return f"{int(round(self.usage_percent))}%"

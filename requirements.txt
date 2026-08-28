@@ -4,5 +4,6 @@ Pillow>=10.0
 psutil>=5.9
 requests>=2.31
 python-dateutil>=2.8
+pystray>=0.19       # tray icon (start.bat launches in background, no console)
 # LibreHardwareMonitor is optional — uncomment to enable CPU/GPU temp/fan/power.
 # HardwareMonitor>=0.6.0

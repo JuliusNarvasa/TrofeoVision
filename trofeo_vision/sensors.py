@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
+import sys
 import threading
 import time
 from typing import Optional
@@ -34,6 +37,70 @@ from .sensors_types import (
 
 
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware name detection
+#
+# Used for the section headers ("CPU STATUS MONITORING" → actual model name).
+# LHM is the preferred source (single source of truth, consistent format).
+# Fallbacks run when LHM isn't loaded (--no-lhm) or hasn't seen the device yet.
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic trailing suffix that Windows + LHM tack onto many CPU names, e.g.
+# "AMD Ryzen 5 5600X 6-Core Processor" → strip " 6-Core Processor".
+# Matches "<N>-Core Processor" or "Processor" on Intel chips.
+_GENERIC_CPU_SUFFIX_RE = re.compile(r"\s+\d+-Core Processor$| Processor$")
+
+
+def _normalize_hw_name(raw: str) -> str:
+    """Trim generic marketing suffixes from a raw hardware name string."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    return _GENERIC_CPU_SUFFIX_RE.sub("", raw)
+
+
+def _detect_cpu_name() -> str:
+    """Best-effort CPU name without LHM. Windows-only; returns "" elsewhere."""
+    if sys.platform != "win32":
+        return ""
+    # Registry is readable without elevation and always present on Windows.
+    try:
+        import winreg  # type: ignore  # Windows-only
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        ) as key:
+            name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+        return _normalize_hw_name(str(name))
+    except Exception as e:  # noqa: BLE001
+        log.debug("CPU name from registry failed: %s", e)
+        return ""
+
+
+def _detect_gpu_name() -> str:
+    """Best-effort GPU name without LHM via WMI (PowerShell CIM). Returns "" on failure.
+
+    Avoids the deprecated ``wmic.exe`` shell — ``Get-CimInstance Win32_VideoController``
+    via PowerShell is the modern equivalent and works without admin.
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_VideoController -Filter \"AdapterCompatibility<>'Parsec' AND AdapterCompatibility<>'SudoMaker'\" | Select-Object -First 1 -ExpandProperty Name)"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return ""
+        name = (out.stdout or "").strip()
+        # CIM returns one name per instance; we already filtered to physical
+        # adapters (skipping Parsec/SudoMaker virtual display drivers).
+        return _normalize_hw_name(name)
+    except Exception as e:  # noqa: BLE001
+        log.debug("GPU name from WMI failed: %s", e)
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +200,12 @@ class SensorReader:
         self._last_net = psutil.net_io_counters()
         self._last_net_time = time.time()
 
+        # Hardware names — resolved once at init (cheap; both fallbacks read
+        # from Windows registry / WMI which we don't want to hit every tick).
+        # Empty string means "unknown" and the renderer falls back to "CPU"/"GPU".
+        self._cpu_name = ""
+        self._gpu_name = ""
+
         # LHM state
         self._lhm_computer = None
         self._lhm_cpu_hw = None
@@ -143,6 +216,20 @@ class SensorReader:
             except Exception as e:  # noqa: BLE001
                 log.warning("LHM init failed, falling back to psutil only: %s", e)
                 self._lhm_computer = None
+
+        # Resolve names. Prefer LHM (already populated if init succeeded);
+        # otherwise fall back to OS-level queries that work without admin.
+        if self._lhm_cpu_hw is not None:
+            self._cpu_name = _normalize_hw_name(self._lhm_cpu_hw.Name or "")
+        if self._lhm_gpu_hw is not None:
+            self._gpu_name = _normalize_hw_name(self._lhm_gpu_hw.Name or "")
+        if not self._cpu_name:
+            self._cpu_name = _detect_cpu_name()
+        if not self._gpu_name:
+            self._gpu_name = _detect_gpu_name()
+        log.info("Detected hardware: CPU=%r, GPU=%r",
+                 self._cpu_name or "(unknown)",
+                 self._gpu_name or "(unknown)")
 
     @property
     def lhm_available(self) -> bool:
@@ -244,7 +331,8 @@ class SensorReader:
         self._snap = snap
 
     def _read_cpu(self) -> CpuStats:
-        cpu = CpuStats(usage_percent=psutil.cpu_percent(interval=None))
+        cpu = CpuStats(usage_percent=psutil.cpu_percent(interval=None),
+                       name=self._cpu_name)
         if self._lhm_cpu_hw is None:
             return cpu
 
@@ -323,7 +411,7 @@ class SensorReader:
         return cpu
 
     def _read_gpu(self) -> GpuStats:
-        gpu = GpuStats()
+        gpu = GpuStats(name=self._gpu_name)
         if self._lhm_gpu_hw is None:
             return gpu
         # AMD RX 7800 XT sensor map (LHM):

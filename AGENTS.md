@@ -54,7 +54,7 @@ y=    |   26°           Mostly Cloudy     ← big temp + condition
 y=    |   ↑30° ↓24° • Feels like —       ← today's hi/lo (em-dash = no data)
 y=    |   (background = <state>_<bucket>.png from assets/weather/) ]
 y=310
-y=326 [CPU STATUS MONITORING]
+y=326 [CPU <model name>]                            ← e.g. "AMD RYZEN 5 5600X"
 y=364 [Hero card (full width, 414×340):
 y=    |  [TAG]                  TEMP 62°
 y=    |   47% CPU USAGE         POWER 78W
@@ -63,7 +63,7 @@ y=    |  │                                                  │
 y=    |  └──────────────────────────────────────────────────┘ ]
 y=720 [Misc card (ONE big card, 4 cells with vertical dividers):
 y=    |  CPU FAN  │ CPU CLOCK │ AIO PUMP  │ VOLTAGE         ]
-y=920 [GPU STATUS MONITORING]
+y=920 [GPU <model name>]                            ← e.g. "AMD RADEON RX 7800 XT"
 y=958 [Hero card (full width) — same structure as CPU  ]
 y=1314 [Misc card: VRAM │ GPU CLOCK │ GPU FAN │ VRAM CLOCK]
 y=1514 [RAM 34%      ] [ROM 56%      ]                  ← 2 wider mini cards (FPS tile removed)
@@ -81,6 +81,53 @@ the 70-px footer band ending at `y=1920`.
 **History:** ring buffer holds 120 samples at 1 Hz (2 minutes). The
 chart legend (USE/TEMP/PWR dots) is the only chart header — no
 seconds-counter title.
+
+---
+
+## THEMING (light + dark)
+
+Two palettes ship out of the box: a light monochrome (the original
+reference look) and a dark low-light palette. The `C` color constants in
+`renderer.py` are now swappable — `set_theme(theme)` overwrites them at
+the start of every frame, so every drawing helper continues to read
+from `C.XXX` without threading a theme parameter through.
+
+**Palettes (`Theme.light()` / `Theme.dark()` in `renderer.py`):**
+
+| Slot | Light | Dark |
+|---|---|---|
+| `BG` / page | `(240,240,244)` | `(18,18,22)` |
+| `CARD` | `(255,255,255)` | `(32,32,38)` |
+| `CARD_EDGE` | `(228,228,232)` | `(60,60,70)` |
+| `TITLE` / `VALUE` | near-black | near-white |
+| `LABEL` / `VALUE_DIM` | medium gray | lighter gray |
+| `BAR_BG` / `BAR_FILL` | light / dark | dark / light (inverted) |
+| `TAG_BG` / `TAG_FG` (ON DEMAND pill) | dark / white | bright / dark (inverted) |
+| `USAGE_LINE` / `TEMP_LINE` / `POWER_LINE` | dark gray / orange / blue | light gray / brighter orange / brighter blue |
+| `GREET_FG` / `GREET_DIM` | white / dim white | unchanged — always on photo background |
+
+**Time-based auto switching** ([theme] in `config.toml`):
+
+```toml
+[theme]
+mode = "auto"           # "auto" | "light" | "dark"
+dark_start_hour = 18    # inclusive
+dark_end_hour = 6       # exclusive (wraps midnight: dark 18-6 = 18:00–05:59)
+```
+
+`mode = "auto"` picks dark when the current local hour falls inside the
+`dark_start_hour` .. `dark_end_hour` window, light otherwise. The window
+may wrap midnight (defaults do — dark 18:00–06:00). A non-wrapping window
+(e.g. `dark_start_hour=20, dark_end_hour=23`) is also supported. Setting
+`dark_start_hour == dark_end_hour` disables the window (always light).
+
+`Renderer.render()` resolves the active theme via `resolve_theme(cfg, dt)`
+before drawing, so every frame is consistently themed. CLI override for
+visual testing: `python scripts/render_offline.py --theme {auto,light,dark}`.
+
+The greeting-tile photo background (`assets/weather/<state>_<bucket>.png`)
+is theme-agnostic — the dark gradient overlay that ensures text
+readability stays the same in both themes.
 
 ---
 
@@ -208,6 +255,19 @@ top of `trofeo_vision/sensors.py`.
   PawnIO AMD SMU scripts, AND unlocks motherboard Super I/O (NCT6796D-R) which
   exposes the CPU fan header RPM and the AIO pump RPM via LPC port reads.
 
+**Hardware names** (displayed in section headers — "AMD RYZEN 5 5600X" instead
+of "CPU STATUS MONITORING", "AMD RADEON RX 7800 XT" instead of "GPU STATUS
+MONITORING"). Resolved once at `SensorReader.__init__`, cached for the lifetime
+of the reader:
+- **CPU name source priority:** LHM `hw.Name` → registry
+  `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\ProcessorNameString`
+  (no admin required) → `"CPU"`. Trailing generic suffixes like
+  `" 6-Core Processor"` are stripped via `_normalize_hw_name()` in
+  `sensors.py`.
+- **GPU name source priority:** LHM `hw.Name` → PowerShell
+  `Get-CimInstance Win32_VideoController` (no admin required; filters out
+  Parsec/SudoMaker virtual display adapters) → `"GPU"`.
+
 ---
 
 ## TROFEO'S OWN THEME FORMAT (for reference)
@@ -253,9 +313,110 @@ python scripts/render_offline.py --no-lhm --save-jpeg --out ./output
 # Live push (requires TRCC closed)
 python -m trofeo_vision.main --rate 4
 
+# Tray mode (recommended) — kills TRCC, launches in background, no console.
+# Right-click the TrofeoVision icon in the system tray for Pause/Resume/Quit.
+.\start.bat
+
 # Continuous dry-run (loops at 1fps, saves frames)
 python scripts/render_offline.py --loop --rate 1 --no-lhm
 ```
+
+---
+
+## TRAY MODE (background, no console)
+
+`start.bat` launches the dashboard as a background process with a
+system-tray icon — no console window appears.
+
+**Launcher chain:** `start.bat` → `start "" pythonw.exe` →
+`scripts/run_tray.py` → `trofeo_vision.tray.TrayApp`.
+
+**`TrayApp` (`trofeo_vision/tray.py`):**
+- Main thread: pystray's Windows message loop (blocks in `icon.run()`).
+- Render thread (daemon): sensors + renderer + USB push, same code path
+  as `run_live()` in `main.py` minus the console signal handlers.
+- Pause/Resume uses a `threading.Event` — render thread blocks cheaply
+  between frames without busy-looping.
+- State machine: `starting → running ⇄ paused → stopped`; transitions
+  to `reconnecting` when USB push fails (typical after the PC sleeps
+  and the device detaches), then auto-recovers to `running` once the
+  device is re-claimed. True unrecoverable errors land in `error`.
+- Sleep/wake resilience: USB errors don't kill the render thread.
+  `_open_with_reconnect()` retries `Driver.open()` every 2 s until the
+  device reappears, and the inner push loop catches `DriverError` to
+  close + reopen on the fly. The display blanks during the gap (still
+  per the "must push continuously" rule) but recovers automatically —
+  no manual relaunch needed after sleep, hibernate, or TRCC racing us
+  for the device at boot.
+
+**Tray menu:**
+- `Status: <state>` — read-only label, reflects current state.
+- `Pause` / `Resume` — toggleable, only one is visible at a time.
+- `Reconnecting — waiting for device…` — visible only while in
+  `reconnecting`, so the user sees why frames have stopped.
+- `Open log folder` — opens `<repo>/logs/` in Explorer.
+- `Quit` — stops the render thread, closes USB, exits.
+
+**Logging:** `<repo>/logs/trofeo_vision.log` (rotating, 1 MB × 3
+backups). No console output because `pythonw.exe` has no stdout.
+
+**Icon:** Generated at startup with PIL — a 64×64 dark rounded square
+with the USE/TEMP/PWR chart-series dots + a small activity wave.
+Colors match `Theme.dark()` from the renderer so the icon visually
+links to the dashboard it drives.
+
+**Headless / debug mode:** `python scripts/run_tray.py --verbose` runs
+the same code path under `python.exe` (with a console) for debugging.
+
+## AUTOSTART (scheduled task, admin)
+
+`start.bat` is registered as a scheduled task that runs elevated at
+logon — replaces the TRCC autostart entries that were removed
+(`HKCU\...\Run\TRCCNext` registry value + `\TRCCAppStartup` scheduled
+task).
+
+| Field | Value |
+|---|---|
+| Task | `\TrofeoVision` (Task Scheduler, root folder) |
+| Trigger | At logon, 30 s delay (lets desktop + USB stack settle) |
+| Action | `D:\Documents\PersonalProjects\Sites\TrofeoVision\start.bat` |
+| Principal | `Bambaw`, `LogonType=InteractiveToken` (sees the USB device and tray) |
+| Run level | `HighestAvailable` (admin) — required so LHM's PawnIO LPC reads + AMD SMU scripts can pull CPU package temp/power/clock + CPU fan + AIO pump RPM |
+| Power | "Stop on battery, No start on batteries" (default) — desktop only |
+
+**Why admin:** `start.bat` itself doesn't need admin, but the LHM
+sensors behind it do — without elevation, CPU temp/power/clock and the
+fan/pump RPMs all stay at 0. The bat's `taskkill /F /IM TRCC.exe /T`
+also benefits from admin so it can kill TRCC's services/children if
+any are lingering.
+
+**Manage:**
+```powershell
+# Status / config
+schtasks /Query /TN '\TrofeoVision' /FO LIST /V
+schtasks /Query /TN '\TrofeoVision' /XML ONE   # shows RunLevel, LogonType, Delay
+
+# Run now (without rebooting)
+schtasks /Run /TN '\TrofeoVision'
+
+# Disable / re-enable (no admin needed — task registration is owned by SYSTEM-owned scheduler service)
+Disable-ScheduledTask -TaskName 'TrofeoVision'
+Enable-ScheduledTask  -TaskName 'TrofeoVision'
+
+# Remove entirely (requires elevation — schtasks.exe requires admin to delete)
+schtasks /Delete /TN '\TrofeoVision' /F
+
+# Re-register (run elevated)
+schtasks /Create /TN 'TrofeoVision' `
+  /TR '"D:\Documents\PersonalProjects\Sites\TrofeoVision\start.bat"' `
+  /SC ONLOGON /RL HIGHEST /DELAY 0000:30 /F
+```
+
+**Why not startup folder or HKCU Run:** both run non-elevated, so LHM
+sensors stay at 0. Startup-folder `.lnk` can't request elevation
+either — only a scheduled task with `RunLevel=HighestAvailable` (or a
+UAC-prompting shortcut marked "run as admin") gets a clean elevated
+start. The 30 s logon delay dodges the UAC prompt race at first login.
 
 ## KNOWN GOTCHAS
 
