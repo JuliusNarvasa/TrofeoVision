@@ -33,6 +33,7 @@ from pystray import Menu, MenuItem
 from .config import Config
 from .driver import Driver, DriverError
 from .history import HistoryBuffer
+from .power import PowerMonitor
 from .renderer import Renderer
 from .sensors import SensorReader
 from .sensors_types import SensorSnapshot
@@ -110,7 +111,7 @@ class TrayApp:
 
     Lifecycle::
 
-        app = TrayApp(cfg, rate=4.0)
+        app = TrayApp(cfg, rate=2.0)
         app.run()    # blocks until Quit is clicked
 
     Threading model:
@@ -144,10 +145,18 @@ class TrayApp:
         self._pause_evt.set()
         # Stop event: signals the render thread to exit.
         self._stop_evt = threading.Event()
+        # Reconnect-log throttle: 0.0 means "no throttling yet, log the
+        # next failure immediately". Updated in _open_with_reconnect.
+        self._reconnect_last_log_at: float = 0.0
 
         self._render_thread: Optional[threading.Thread] = None
         self._sensors: Optional[SensorReader] = None
         self._driver: Optional[Driver] = None
+
+        # Sleep/wake detector — fires before the USB stack dies so we can
+        # close the device cleanly, and again on wake so we reconnect fast.
+        self._power = PowerMonitor()
+        self._power.start()
 
         # Icon + menu are built once; pystray re-evaluates the menu's
         # visible/enabled lambdas on every update_menu() call.
@@ -158,17 +167,21 @@ class TrayApp:
     # ── Menu ─────────────────────────────────────────────────────────────
     def _build_menu(self) -> Menu:
         # Status label is dynamic so the user can see *when* the app
-        # drops into RECONNECTING (typically after a PC sleep/wake).
+        # drops into RECONNECTING (typically after a PC sleep/wake) or
+        # into ERROR. The label lambda re-evaluates on every
+        # icon.update_menu() call (pystray calls it on the UI thread).
         # Other items are static; their visibility lambdas re-evaluate
         # on every icon.update_menu() call.
         return Menu(
-            MenuItem("Status: starting", None, enabled=False),
+            MenuItem(
+                text=lambda _: f"Status: {self._format_state(self._safe_state())}",
+                action=None,
+                enabled=False,
+            ),
             MenuItem("Pause",  self._on_pause,
                      visible=lambda _: self._safe_state() == self.STATE_RUNNING),
             MenuItem("Resume", self._on_resume,
                      visible=lambda _: self._safe_state() == self.STATE_PAUSED),
-            MenuItem("Reconnecting — waiting for device…", None, enabled=False,
-                     visible=lambda _: self._safe_state() == self.STATE_RECONNECTING),
             MenuItem("Open log folder", self._on_open_log),
             Menu.SEPARATOR,
             MenuItem("Quit", self._on_quit),
@@ -177,6 +190,22 @@ class TrayApp:
     def _safe_state(self) -> str:
         with self._lock:
             return self._state
+
+    def _safe_state_error(self) -> str:
+        with self._lock:
+            return self._error_msg[:80]
+
+    def _format_state(self, state: str) -> str:
+        """Map an internal state to its menu-label string. Called from
+        the label lambda on the UI thread; takes ``state`` already
+        extracted under the lock so this helper stays lock-free and
+        lock-safe (no nested lock acquisition).
+        """
+        if state == self.STATE_RECONNECTING:
+            return "reconnecting — waiting for device"
+        if state == self.STATE_ERROR:
+            return f"error: {self._safe_state_error()}"
+        return state  # starting / running / paused / stopped
 
     def _set_state(self, new_state: str, error_msg: str = "") -> None:
         with self._lock:
@@ -273,6 +302,38 @@ class TrayApp:
                 if self._stop_evt.is_set():
                     break
 
+                # ── Power events ────────────────────────────────────────
+                # Check suspend/resume between frames. Suspend fires BEFORE
+                # the USB stack goes down, so we can release the device
+                # cleanly instead of waiting for the next push to error out.
+                # Resume simply logs — the existing reconnect retry loop
+                # will pick the device back up on its next attempt.
+                if self._power.consume_suspend(timeout=0):
+                    log.warning("[SLEEP] System about to suspend — "
+                                "closing USB device cleanly")
+                    try:
+                        driver.close()
+                    except Exception:
+                        log.exception("Error closing driver before suspend")
+                    self._set_state(self.STATE_RECONNECTING,
+                                    "system suspended")
+                    # Loop into the existing reconnect retry path; it
+                    # will block on open() errors until the device comes
+                    # back on wake. Stop event still honored.
+                    if not self._open_with_reconnect(
+                            driver, self.RECONNECT_BACKOFF_S):
+                        return
+                    try:
+                        self._set_state(self.STATE_RUNNING)
+                    except Exception:  # noqa: BLE001
+                        log.exception("Post-reconnect set_state failed")
+                    continue  # skip the per-frame sleep + skip a frame
+
+                if self._power.consume_resume(timeout=0):
+                    log.info("[WAKE] System resumed from sleep")
+                    # No special action — the reconnect loop (if any)
+                    # already has the device or will on its next 2s tick.
+
                 try:
                     snap = sensors.snapshot
                     if (not hasattr(snap.weather, "available")
@@ -306,8 +367,19 @@ class TrayApp:
                         log.exception("Error closing driver during reconnect")
                     if not self._open_with_reconnect(driver, self.RECONNECT_BACKOFF_S):
                         return  # stopped during reconnect
-                    log.info("USB reconnected — resuming push")
-                    self._set_state(self.STATE_RUNNING)
+                    # Post-reconnect state flip + menu refresh. Wrap in
+                    # its own try so a stray COM / UI exception here
+                    # doesn't escape the outer DriverError handler and
+                    # get reclassified as "Render loop crashed" — the
+                    # driver is already back, keep pushing frames.
+                    try:
+                        log.info("USB reconnected — resuming push")
+                        self._set_state(self.STATE_RUNNING)
+                    except Exception as inner_exc:  # noqa: BLE001
+                        log.exception(
+                            "Error post-reconnect (continuing push): %s",
+                            inner_exc,
+                        )
                     continue  # skip the per-frame sleep after a reconnect
 
                 # Sleep but stay responsive to stop/pause.
@@ -332,17 +404,34 @@ class TrayApp:
         Returns ``True`` if ``driver.open()`` succeeded, ``False`` if the
         user asked to quit while we were waiting. While waiting the state
         is set to ``RECONNECTING`` so the tray menu surfaces it.
+
+        Logging is throttled to once every 30 s after the *first*
+        failure (always emitted immediately) so an hour of retries
+        doesn't produce 1800 identical log lines. State flips and the
+        ``_wait_or_stop`` sleep still happen on every retry.
         """
         while not self._stop_evt.is_set():
             try:
                 driver.open()
-                return True
             except DriverError as e:
                 self._set_state(self.STATE_RECONNECTING, str(e))
-                log.info("USB not available (%s) — retrying in %.1fs",
-                         e, backoff_s)
+                now = time.monotonic()
+                # 0.0 sentinel = "no prior log in this reconnect series";
+                # also handles the case where a previous series left a
+                # stale timestamp < 30 s ago but we successfully
+                # reconnected — see the reset below.
+                if (self._reconnect_last_log_at == 0.0
+                        or (now - self._reconnect_last_log_at) >= 30.0):
+                    log.info("USB not available (%s) — retrying in %.1fs",
+                             e, backoff_s)
+                    self._reconnect_last_log_at = now
                 if self._wait_or_stop(backoff_s):
                     return False
+                continue
+            # Success: reset the throttle so the *next* failure series
+            # logs its first attempt immediately.
+            self._reconnect_last_log_at = 0.0
+            return True
         return False
 
     def _wait_or_stop(self, seconds: float) -> bool:
@@ -390,6 +479,10 @@ class TrayApp:
                 self._sensors.stop()
         except Exception:  # noqa: BLE001
             log.exception("Error stopping sensors")
+        try:
+            self._power.stop()
+        except Exception:  # noqa: BLE001
+            log.exception("Error stopping power monitor")
 
     # ── Public entry ─────────────────────────────────────────────────────
     def run(self) -> None:

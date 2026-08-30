@@ -22,7 +22,11 @@ class UsbConfig:
     endpoint_out: int = 0x09
     endpoint_in: int = 0x81
     # How many jpeg frames the device expects per second.
-    target_fps: float = 4.0
+    # Default 2 FPS — the LCD is a passive glanceable display, not a
+    # gaming monitor. Halving from 4 FPS cuts frame-push CPU + USB I/O
+    # roughly in half without any visible difference to the eye at
+    # glance distance. Bump this in config.toml if you want smoother.
+    target_fps: float = 2.0
     # How often to refresh sensor data (decoupled from frame push).
     sensor_refresh_seconds: float = 1.0
 
@@ -112,14 +116,14 @@ product_id = 0x5408
 interface = 0
 endpoint_out = 9
 endpoint_in = 129   # 0x81
-target_fps = 4.0
+target_fps = 2.0
 sensor_refresh_seconds = 1.0
 
 [weather]
 enabled = false
 # Get a key at https://home.openweathermap.org/api_keys then paste it here
 # and flip ``enabled`` to true.
-api_key = "ed7a1951eca9ad8594c294de15e2b03f"
+api_key = ""  # paste your OWM key here (https://home.openweathermap.org/api_keys)
 city = "Davao"
 country = "PH"
 units = "metric"

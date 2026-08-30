@@ -32,7 +32,7 @@ pixel-perfect, fully-live dashboard widgets (CPU/GPU/RAM/ROM/Net/Time/Weather).
 | EP IN | `0x81` (bulk) |
 | Protocol | LY Bulk (chunked JPEG) |
 | JPEG quality | 85, baseline, 4:4:4 subsampling |
-| Frame rate | ~6.3 FPS (USB 2.0 limited) |
+| Frame rate | ~6.3 FPS (USB 2.0 hardware cap), **default target 2 FPS** |
 
 **Driver binding:** If pyusb can't see the device after TRCC install, use Zadig
 to replace the driver with WinUSB for VID `0416` PID `5408`.
@@ -81,6 +81,16 @@ the 70-px footer band ending at `y=1920`.
 **History:** ring buffer holds 120 samples at 1 Hz (2 minutes). The
 chart legend (USE/TEMP/PWR dots) is the only chart header — no
 seconds-counter title.
+
+**Sensor cadences:** the LHM hardware tree is split into two refresh
+rates so we don't pay the LPC/EC tree-walk cost at every tick:
+- **Fast (1 Hz):** CPU + GPU only — temp/power/clock/VRAM need fresh
+  data for the dashboard.
+- **Slow (every 3 s):** motherboard + anything else — CPU fan + AIO
+  pump RPMs are the only sensors here, and they barely change
+  second-to-second. The split is in `SensorReader._tick` with the
+  interval hard-coded as `_LHM_SLOW_INTERVAL_S` near the top of
+  `sensors.py`.
 
 ---
 

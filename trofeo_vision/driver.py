@@ -11,6 +11,13 @@ Frame format (JPEG, 462x1920 portrait):
 
 This module is the *only* file that talks USB. Everything else can run with
 a saved JPEG on disk via Driver.dry_run.
+
+Sleep/wake resilience: ``open()`` retries once on ``set_configuration``
+ACCESS errors after disposing the candidate device's resources. This
+covers the common post-suspend case where Windows has a stale claim on
+the interface until the bus reset completes (typically <500 ms after
+wake). Without this, every retry gets ``[Errno 13] Access denied`` until
+the user manually quits and relaunches.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ from __future__ import annotations
 import io
 import logging
 import struct
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -30,6 +38,11 @@ log = logging.getLogger(__name__)
 # USB identifiers
 TROFEO_VID = 0x0416
 TROFEO_PID = 0x5408
+
+# libusb errno for "Access denied" — happens on set_configuration when the
+# interface is still claimed by another process (TRCC) or the kernel driver
+# hasn't released yet (post-suspend).
+LIBUSB_ERROR_ACCESS = 13
 
 
 class DriverError(RuntimeError):
@@ -70,7 +83,13 @@ class Driver:
 
     # ── Lifecycle ────────────────────────────────────────────────────
     def open(self) -> None:
-        """Claim the USB interface. Raises DriverError if it fails."""
+        """Claim the USB interface. Raises DriverError if it fails.
+
+        On ``set_configuration`` ACCESS errors (typical after sleep/wake),
+        disposes the candidate device's resources, detaches any kernel
+        driver, waits briefly, and retries once. If still failing, raises
+        so the tray reconnect loop can back off.
+        """
         try:
             import usb.core          # noqa: F401 — lazy import keeps dry-run pure
             import usb.util
@@ -80,42 +99,89 @@ class Driver:
             ) from e
 
         import usb.core
-        dev = usb.core.find(idVendor=self.vendor_id, idProduct=self.product_id)
-        if dev is None:
-            raise DriverError(
-                f"Device {self.vendor_id:04X}:{self.product_id:04X} not found. "
-                "Is TRCC closed? Is the WinUSB driver bound (try Zadig)?"
+
+        last_err: Optional[BaseException] = None
+        for attempt in (1, 2):
+            dev = usb.core.find(
+                idVendor=self.vendor_id, idProduct=self.product_id,
             )
+            if dev is None:
+                raise DriverError(
+                    f"Device {self.vendor_id:04X}:{self.product_id:04X} "
+                    "not found. Is TRCC closed? Is the WinUSB driver "
+                    "bound (try Zadig)?"
+                )
 
-        # Detach kernel driver if any (Windows usually doesn't have one for WinUSB,
-        # but be safe).
-        try:
-            if dev.is_kernel_driver_active(0):  # type: ignore[attr-defined]
-                try:
-                    dev.detach_kernel_driver(0)  # type: ignore[attr-defined]
-                except Exception as e:  # noqa: BLE001
-                    log.debug("detach_kernel_driver: %s", e)
-        except Exception:  # noqa: BLE001
-            pass
+            # Detach kernel driver if any (Windows usually doesn't have one
+            # for WinUSB, but be safe).
+            try:
+                if dev.is_kernel_driver_active(0):  # type: ignore[attr-defined]
+                    try:
+                        dev.detach_kernel_driver(0)  # type: ignore[attr-defined]
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("detach_kernel_driver: %s", e)
+            except Exception:  # noqa: BLE001
+                pass
 
-        try:
-            dev.set_configuration()  # type: ignore[attr-defined]
-        except Exception as e:  # noqa: BLE001
-            raise DriverError(f"set_configuration failed: {e}") from e
+            # Force-dispose any libusb-level resources on this dev before
+            # set_configuration. After sleep/wake the USB bus reset leaves
+            # libusb with stale endpoint handles; without this, retry
+            # loops forever with [Errno 13] Access denied.
+            try:
+                usb.util.dispose_resources(dev)  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001
+                pass
 
-        try:
-            usb.util.claim_interface(dev, 0)  # type: ignore[arg-type]
-            self._claimed = True
-        except Exception as e:  # noqa: BLE001
-            raise DriverError(
-                f"Could not claim USB interface — TRCC may still be running: {e}"
-            ) from e
+            try:
+                dev.set_configuration()  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                errno = getattr(e, "errno", None)
+                if errno == LIBUSB_ERROR_ACCESS and attempt == 1:
+                    log.warning(
+                        "set_configuration ACCESS denied (attempt 1/2) — "
+                        "USB device still held, will retry after %.1fs",
+                        0.5,
+                    )
+                    _time.sleep(0.5)
+                    continue
+                raise DriverError(
+                    f"set_configuration failed: {e}"
+                ) from e
 
-        self._dev = dev
-        log.info("USB device %04X:%04X opened", self.vendor_id, self.product_id)
+            try:
+                usb.util.claim_interface(dev, 0)  # type: ignore[arg-type]
+                self._claimed = True
+            except Exception as e:  # noqa: BLE001
+                raise DriverError(
+                    f"Could not claim USB interface — TRCC may still be "
+                    f"running: {e}"
+                ) from e
 
-        # Init handshake: send 2048 bytes, read 512.
-        self._handshake()
+            self._dev = dev
+            log.info("USB device %04X:%04X opened", self.vendor_id, self.product_id)
+
+            # Init handshake: send 2048 bytes, read 512.
+            try:
+                self._handshake()
+            except DriverError:
+                # Handshake can fail on a half-recovered bus — release
+                # cleanly so the caller can retry fresh.
+                self.close()
+                if attempt == 1:
+                    log.warning(
+                        "Handshake failed on attempt 1/2, retrying once"
+                    )
+                    _time.sleep(0.3)
+                    continue
+                raise
+            return
+
+        # Defensive: should not reach here because the inner branches raise
+        # or return. But keep the explicit raise for type-checkers.
+        raise DriverError(
+            f"open() failed after retries: {last_err}"
+        ) if last_err else DriverError("open() failed: unknown")
 
     def close(self) -> None:
         if self._dev is None:
@@ -126,6 +192,14 @@ class Driver:
                 usb.util.release_interface(self._dev, 0)  # type: ignore[arg-type]
             except Exception:  # noqa: BLE001
                 pass
+        # Force-dispose libusb-level resources so the next open() starts
+        # from a clean slate — this is what fixes the persistent
+        # "Access denied" loop after sleep/wake.
+        try:
+            import usb.util
+            usb.util.dispose_resources(self._dev)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._dev.attach_kernel_driver(0)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001

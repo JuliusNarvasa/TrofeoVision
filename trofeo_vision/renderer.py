@@ -266,6 +266,17 @@ class T:
 # Font loading — use Microsoft YaHei (same as TRCC) on Windows, with fallbacks.
 # ─────────────────────────────────────────────────────────────────────────────
 _FONT_CACHE: dict[tuple[str, int], Any] = {}
+# Cache for `_text_wh` measurements. Many labels (section "ON DEMAND" pill,
+# chart legend "USE"/"TEMP"/"PWR", misc grid labels) are static and called
+# every frame; ``draw.textbbox`` walks font internals each call. We key on
+# ``(text, id(font))`` — fonts are kept alive by `_FONT_CACHE`, so their
+# object ids are stable for the program's lifetime.
+_TEXT_WH_CACHE: dict[tuple[str, int], tuple[int, int]] = {}
+# Pre-baked rounded + gradient masks for the greeting tile. Inputs (w, h,
+# radius) are constant for the one call site, so the 280-row PIL gradient
+# loop and the pieslice mask only need to run once. Cached here so the
+# per-frame draw path just does an ImageChops lookup.
+_GREETING_MASK_CACHE: dict[tuple, Image.Image] = {}
 
 
 def _font(name: str, size: int):
@@ -315,9 +326,19 @@ def _text(draw, xy, text, font, fill=C.VALUE, anchor="la"):
 
 
 def _text_wh(draw, text, font):
-    """Return (w, h) of text in given font."""
+    """Return (w, h) of text in given font.
+
+    Result depends only on (text, font), so we cache it at module scope.
+    The ``draw`` arg is unused on cache hits.
+    """
+    key = (text, id(font))
+    cached = _TEXT_WH_CACHE.get(key)
+    if cached is not None:
+        return cached
     bbox = draw.textbbox((0, 0), text, font=font)
-    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+    size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+    _TEXT_WH_CACHE[key] = size
+    return size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -705,12 +726,21 @@ def _make_rounded_mask(w: int, h: int, radius: int) -> Image.Image:
     effectively ignores the ``radius`` argument in some versions (only
     chamfers a couple of corner pixels). The pieslice + rect combo draws
     a true quarter-circle at every corner.
+
+    Cached by (w, h, radius) — the same inputs always produce the same
+    pixels, and the greeting tile is the only call site so the cache
+    stays bounded.
     """
+    key = (w, h, radius)
+    cached = _GREETING_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
     r = max(0, min(radius, w // 2, h // 2))
     mask = Image.new("L", (w, h), 0)
     d = ImageDraw.Draw(mask)
     if r == 0:
         d.rectangle((0, 0, w - 1, h - 1), fill=255)
+        _GREETING_MASK_CACHE[key] = mask
         return mask
     # Four corner pieslices fill the rounded quadrant at each corner.
     d.pieslice((0, 0, 2 * r - 1, 2 * r - 1), 180, 270, fill=255)
@@ -720,7 +750,30 @@ def _make_rounded_mask(w: int, h: int, radius: int) -> Image.Image:
     # Interior rectangle (excluding the four corner quadrants).
     d.rectangle((r, 0, w - r - 1, h - 1), fill=255)
     d.rectangle((0, r, w - 1, h - r - 1), fill=255)
+    _GREETING_MASK_CACHE[key] = mask
     return mask
+
+
+# Quadratic top→bottom dark gradient (max_alpha=110/255) intersected with
+# the rounded mask. The greeting tile calls this with the same (w, h, radius)
+# every frame, so cache the combined mask — the per-frame draw path becomes
+# a single ``image.paste(..., combined)``.
+def _make_greeting_overlay(w: int, h: int, radius: int,
+                           max_alpha: int = 110) -> Image.Image:
+    key = (w, h, radius, max_alpha)
+    cached = _GREETING_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    grad_alpha = Image.new("L", (w, h), 0)
+    gd = ImageDraw.Draw(grad_alpha)
+    for row in range(h):
+        ratio = row / max(1, h - 1)
+        a = int(max_alpha * ratio * ratio)
+        gd.line([(0, row), (w - 1, row)], fill=a)
+    rounded = _make_rounded_mask(w, h, radius)
+    combined = ImageChops.multiply(grad_alpha, rounded)
+    _GREETING_MASK_CACHE[key] = combined
+    return combined
 
 
 def _paste_rounded(image: Image.Image, source: Image.Image,
@@ -788,22 +841,12 @@ def draw_greeting_tile(image: Image.Image, draw: ImageDraw.ImageDraw,
         _paste_rounded(image, bg, x, y, w, h, radius=radius)
 
     # ── 2. Readability overlay (rounded) ───────────────────────────────
-    # Build the gradient as an L-mode alpha mask (the alpha values for how
-    # much black to mix in at each row), then paste solid black with that
-    # mask — Pillow's ``paste`` only does the right thing when the source
-    # is RGB and the mask is L; RGBA-on-L composites oddly.
-    grad_alpha = Image.new("L", (w, h), 0)
-    gd = ImageDraw.Draw(grad_alpha)
-    max_alpha = 110
-    for row in range(h):
-        ratio = row / max(1, h - 1)
-        a = int(max_alpha * ratio * ratio)
-        gd.line([(0, row), (w - 1, row)], fill=a)
-    # Intersect the gradient alpha with the rounded mask so the gradient
-    # doesn't bleed past the card corners.
-    rounded = _make_rounded_mask(w, h, radius)
-    combined = ImageChops.multiply(grad_alpha, rounded)
-    image.paste((0, 0, 0), (x, y), combined)
+    # Pre-baked combined mask: vertical gradient × rounded clip. Same inputs
+    # every frame, so the heavy 280-row PIL loop runs once at first use.
+    # ``paste`` only composites correctly when the source is RGB and the
+    # mask is L; RGBA-on-L composites oddly.
+    overlay_mask = _make_greeting_overlay(w, h, radius)
+    image.paste((0, 0, 0), (x, y), overlay_mask)
 
     # ── 3. Text ─────────────────────────────────────────────────────────
     greet_font = _font(SEGOE, T.GREETING)

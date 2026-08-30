@@ -97,7 +97,7 @@ Create `trofeo_vision/config.toml`:
 [usb]
 vendor_id = 0x0416
 product_id = 0x5408
-target_fps = 4.0
+target_fps = 2.0
 sensor_refresh_seconds = 1.0
 
 [weather]

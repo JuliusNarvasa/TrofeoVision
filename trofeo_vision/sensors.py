@@ -113,6 +113,11 @@ def _detect_gpu_name() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 _LHM_AVAILABLE = False
 _LHM_IMPORT_ERROR: Optional[str] = None
+# Motherboard-class hardware (CPU fan + AIO pump + any other top-level hw
+# that isn't CPU/GPU) is refreshed at this cadence instead of every tick.
+# 3 s is invisible for a fan/pump gauge and avoids walking the LPC/EC tree
+# at 1 Hz. The CPU/GPU fast path still ticks every ``interval`` second.
+_LHM_SLOW_INTERVAL_S: float = 3.0
 try:
     import clr  # type: ignore  # from pythonnet
     # IMPORTANT: clr (pythonnet 3.x with coreclr runtime) only exposes
@@ -210,6 +215,13 @@ class SensorReader:
         self._lhm_computer = None
         self._lhm_cpu_hw = None
         self._lhm_gpu_hw = None
+        # Hardware that updates at a slower cadence (motherboard + anything
+        # not classified as CPU/GPU). Fan/pump RPMs barely change second-to-
+        # second, so refreshing them at 1 Hz is overkill — and each
+        # ``Hardware.Update()`` walks the LPC/EC sub-tree which is the
+        # dominant cost of an LHM tick.
+        self._lhm_slow_hw: list = []
+        self._last_slow_update: float = 0.0
         if enable_lhm and _LHM_AVAILABLE:
             try:
                 self._init_lhm()
@@ -281,6 +293,11 @@ class SensorReader:
                 self._lhm_cpu_hw = hw
             elif ("gpu" in t or "radeon" in n or "geforce" in n) and self._lhm_gpu_hw is None:
                 self._lhm_gpu_hw = hw
+            else:
+                # Everything else (motherboard + any unclassified top-level
+                # hw LHM enumerates) — fans/pump/aux sensors refresh on
+                # the slow cadence in ``_tick``.
+                self._lhm_slow_hw.append(hw)
         self._lhm_computer = computer
         log.info("LHM hardware: %s / %s",
                  self._lhm_cpu_hw.Name if self._lhm_cpu_hw else "(no CPU)",
@@ -307,10 +324,22 @@ class SensorReader:
             self._update_tree(sub)
 
     def _tick(self):
-        # Update LHM hardware tree.
+        # Update LHM hardware tree, split into fast/slow cadences.
         if self._lhm_computer is not None:
-            for hw in self._lhm_computer.Hardware:
-                self._update_tree(hw)
+            # Fast (every tick): CPU + GPU. Temp/power/clock/VRAM need
+            # fresh data for the dashboard.
+            if self._lhm_cpu_hw is not None:
+                self._update_tree(self._lhm_cpu_hw)
+            if self._lhm_gpu_hw is not None:
+                self._update_tree(self._lhm_gpu_hw)
+            # Slow (every ~3 s): motherboard + anything else. The LPC/EC
+            # tree walk is the dominant cost of an LHM tick; CPU fan + AIO
+            # pump RPMs don't need 1 Hz granularity.
+            now = time.time()
+            if (now - self._last_slow_update) >= _LHM_SLOW_INTERVAL_S:
+                for hw in self._lhm_slow_hw:
+                    self._update_tree(hw)
+                self._last_slow_update = now
 
         mem = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
