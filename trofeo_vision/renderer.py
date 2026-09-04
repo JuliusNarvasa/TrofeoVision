@@ -29,6 +29,13 @@ from .weather import (
     icon_to_state,
     time_bucket,
 )
+from .air_quality import (
+    AirQualityImages,
+    greeting_for_bucket as aq_greeting_for_bucket,
+    time_bucket as aq_time_bucket,
+    aqi_to_state,
+    aqi_category_label,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,6 +915,150 @@ def draw_greeting_tile(image: Image.Image, draw: ImageDraw.ImageDraw,
           font=hilo_font, fill=C.GREET_DIM)
 
 
+def draw_air_quality_tile(image: Image.Image, draw: ImageDraw.ImageDraw,
+                          x: int, y: int, w: int, h: int,
+                          snapshot: SensorSnapshot,
+                          greeting_name: str,
+                          air_quality_images: Optional[AirQualityImages]):
+    """Top-of-dashboard greeting + air quality tile.
+
+    Mirrors ``draw_greeting_tile``'s layout (414×268 area, same y-positions)
+    so flipping between weather and air quality in the tray swaps the
+    payload but keeps the visual rhythm identical. Layout::
+
+        y+ 22  Good <time>, <name>                              ← greeting (left)
+        y+ 56  • <location>                                     ← location (left, dim)
+        y+110  3                          Moderate              ← big AQI (left), category (right)
+        y+194  PM2.5 12.4 µg/m³ · PM10 18.0 µg/m³              ← pollutant line
+
+    Background: AQI-state image from ``air_quality_images`` (falls back
+    to a category-color vertical gradient). Both the photo AND the
+    readability overlay are clipped to the same rounded rect as the
+    weather tile so the corners match every other card.
+
+    When air quality is disabled or fetch fails
+    (``snapshot.air_quality.available=False``), the tile still renders
+    with the greeting intact and em-dash placeholders for the payload.
+    """
+    radius = 14
+    # ── 1. Background image (rounded) ──────────────────────────────────
+    now = datetime.fromtimestamp(snapshot.timestamp)
+    bucket = aq_time_bucket(now)
+    aq = snapshot.air_quality
+    if air_quality_images is not None and aq.available and aq.aqi_label:
+        state = aq.aqi_label
+        bg = air_quality_images.get(state, bucket)
+    else:
+        # Disabled / failed: show the "good" gradient so the tile still
+        # looks intentional rather than blank or defaulting to a "severe"
+        # color that would be misleading.
+        state = "good"
+        bg = air_quality_images.get(state, bucket) if air_quality_images is not None else None
+
+    if bg is not None:
+        _paste_rounded(image, bg, x, y, w, h, radius=radius)
+
+    # ── 2. Readability overlay (rounded) — same as the weather tile ────
+    overlay_mask = _make_greeting_overlay(w, h, radius)
+    image.paste((0, 0, 0), (x, y), overlay_mask)
+
+    # ── 3. Text ─────────────────────────────────────────────────────────
+    greet_font = _font(SEGOE, T.GREETING)
+    loc_font   = _font(SEGOE, T.GREET_LOC)
+    aqi_font   = _font(SEGOE, T.GREET_TEMP)
+    cat_font   = _font(SEGOE, T.GREET_COND)
+    hilo_font  = _font(SEGOE, T.GREET_HILO)
+
+    pad_x = 24
+
+    # Greeting (top-left) — same string + same bucket logic as weather.
+    greet_text = f"{aq_greeting_for_bucket(bucket)}, {greeting_name}"
+    _text(draw, (x + pad_x, y + 22), greet_text,
+          font=greet_font, fill=C.GREET_FG)
+
+    # Location + payload.
+    if aq.available:
+        location = aq.location or "—"
+        # Bare 1–5 integer — same vertical slot as the weather temp so the
+        # big-number layout is visually consistent across modes.
+        aqi_str = str(aq.aqi) if aq.aqi else "—"
+        category = aqi_category_label(aq.aqi)
+        # Pollutant line. Show PM2.5 + PM10 with one decimal — that's
+        # what most AQI dashboards show, and the column width is plenty.
+        pm25 = aq.pm25
+        pm10 = aq.pm10
+        pm25_str = f"{pm25:.1f}" if pm25 > 0 else "—"
+        pm10_str = f"{pm10:.1f}" if pm10 > 0 else "—"
+        pollutants = (
+            f"PM2.5 {pm25_str} \u00b5g/m\u00b3  \u2022  "
+            f"PM10 {pm10_str} \u00b5g/m\u00b3"
+        )
+    else:
+        # Disabled state — surface the actionable next step. Open-Meteo
+        # doesn't require an API key, so the only "disabled" reasons
+        # are: ``enabled=false`` in config, or a fetch/parse error
+        # (geocode miss, CAMS no-reading, network). The renderer
+        # surfaces the error verbatim for the latter.
+        if aq.error == "air quality disabled":
+            location = "set [air_quality] enabled = true"
+        else:
+            location = aq.error or "weather station offline"
+        aqi_str = "—"
+        category = "—"
+        pollutants = "PM2.5 —  •  PM10 —"
+
+    # Location (left, below greeting).
+    _text(draw, (x + pad_x, y + 56),
+          f"\u2022 {location}",
+          font=loc_font, fill=C.GREET_DIM)
+
+    # Big AQI number (left, dominant). Bare integer; bare "—" when
+    # unavailable so the layout doesn't shift between frames.
+    _text(draw, (x + pad_x, y + 110), aqi_str,
+          font=aqi_font, fill=C.GREET_FG)
+
+    # Category label (right of the AQI, same baseline as the weather
+    # tile's "Mostly Cloudy" treatment).
+    aqi_w, _ = _text_wh(draw, aqi_str, aqi_font)
+    cat_x = x + pad_x + aqi_w + 18
+    _text(draw, (cat_x, y + 134), category,
+          font=cat_font, fill=C.GREET_FG)
+
+    # Pollutant line (bottom-left) — same y slot as the weather tile's
+    # hi/lo + feels-like row.
+    _text(draw, (x + pad_x, y + h - 26), pollutants,
+          font=hilo_font, fill=C.GREET_DIM)
+
+
+def draw_top_tile(image: Image.Image, draw: ImageDraw.ImageDraw,
+                  x: int, y: int, w: int, h: int,
+                  snapshot: SensorSnapshot,
+                  greeting_name: str,
+                  top_tile_mode: str,
+                  weather_images: Optional[WeatherImages],
+                  air_quality_images: Optional[AirQualityImages]) -> None:
+    """Dispatcher: pick the top-tile payload based on ``top_tile_mode``.
+
+    ``top_tile_mode`` is one of:
+        "weather"     — draw_greeting_tile (original layout).
+        "air_quality" — draw_air_quality_tile (greeting + AQI + PM2.5/PM10).
+
+    Unknown modes fall back to weather so a typo in config.toml never
+    breaks the dashboard.
+
+    The two tile renderers share the same dimensions, y-positions, color
+    slots, fonts, and overlay mask — so flipping modes looks like a
+    payload swap, not a layout rebuild.
+    """
+    if top_tile_mode == "air_quality":
+        draw_air_quality_tile(image, draw, x, y, w, h, snapshot,
+                              greeting_name, air_quality_images)
+        return
+    # Default: weather (also the safe fallback for unknown modes).
+    draw_greeting_tile(image, draw, x, y, w, h, snapshot,
+                       greeting_name, weather_images)
+
+
 # OpenWeatherMap icon prefix → human-readable condition string.
 # Covers the 9 prefixes exposed by OWM; anything else falls back to "".
 _WX_CONDITION_LABELS = {
@@ -1031,16 +1182,20 @@ class Renderer:
                greeting_name: str = "",
                weather_images: Optional[WeatherImages] = None,
                theme_cfg: Optional[Any] = None,
-               now: Optional[datetime] = None) -> Image.Image:
+               now: Optional[datetime] = None,
+               top_tile_mode: str = "weather",
+               air_quality_images: Optional[AirQualityImages] = None) -> Image.Image:
         """Draw a full frame and return it as a PIL.Image (RGB).
 
         ``history`` is an optional HistoryBuffer; when provided, its
         CPU/GPU sample lists are drawn into the matching hero cards.
 
-        ``greeting_name`` and ``weather_images`` drive the greeting tile at
-        the top of the dashboard. When ``weather_images`` is None the tile
-        still renders the greeting + dimmed fallback so the layout stays
-        intact even on a fresh install.
+        ``greeting_name``, ``weather_images`` and ``air_quality_images``
+        drive the top tile. ``top_tile_mode`` picks which payload is
+        shown — "weather" (default, original layout) or "air_quality"
+        (greeting + AQI + PM2.5/PM10). When the chosen mode's image
+        loader is None the dispatcher still renders the greeting + a
+        graceful fallback so the layout stays intact on a fresh install.
 
         ``theme_cfg`` is an optional ThemeConfig (see ``config.py``). When
         ``None`` the renderer falls back to light mode for backwards
@@ -1054,12 +1209,15 @@ class Renderer:
 
         img, draw = self._fresh()
         self.image, self.draw = img, draw
-        self._draw_layout(snapshot, history, greeting_name, weather_images)
+        self._draw_layout(snapshot, history, greeting_name,
+                          top_tile_mode, weather_images, air_quality_images)
         return img
 
     def _draw_layout(self, snap: SensorSnapshot, history: Optional[Any] = None,
                      greeting_name: str = "",
-                     weather_images: Optional[WeatherImages] = None):
+                     top_tile_mode: str = "weather",
+                     weather_images: Optional[WeatherImages] = None,
+                     air_quality_images: Optional[AirQualityImages] = None):
         d = self.draw
         assert d is not None
         img = self.image
@@ -1082,12 +1240,14 @@ class Renderer:
         card_w = self.width - 24 * 2
         left_x = 24
 
-        # ── Greeting tile (replaces the old bottom-of-screen weather card)
+        # ── Top tile (weather or air quality — picked by the tray/config)
         # Height trimmed 280 → 268 so the layout still fits after the
-        # header-bottom-padding increase below.
+        # header-bottom-padding increase below. draw_top_tile dispatches
+        # to draw_greeting_tile or draw_air_quality_tile based on mode.
         greet_h = 268
-        draw_greeting_tile(img, d, left_x, 30, card_w, greet_h,
-                           snap, greeting_name or "friend", weather_images)
+        draw_top_tile(img, d, left_x, 30, card_w, greet_h,
+                      snap, greeting_name or "friend",
+                      top_tile_mode, weather_images, air_quality_images)
         y = 30 + greet_h + gap  # 314
 
 # ── CPU section ──────────────────────────────────────────────

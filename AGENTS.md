@@ -189,6 +189,96 @@ intentional, not broken.
 
 ---
 
+## TOP TILE — weather OR air quality
+
+The greeting tile at the top of the dashboard can show one of two
+payloads, switched live from the tray menu (radio items under
+"Force Refresh" in the right-click menu). Persisted to `[top_tile].mode`
+in `config.toml` so the choice survives restart.
+
+| `mode` value | Tile shows |
+|---|---|
+| `weather` | Original layout — greeting + temp + condition + today's hi/lo + feels-like |
+| `air_quality` | Greeting + raw US AQI number (0–500) + category + PM2.5 μg/m³ + PM10 μg/m³ |
+
+Layout is identical across modes (same x/y/font/overlay) so flipping is
+a payload swap, not a layout rebuild. Background comes from
+`assets/air_quality/<aqi_state>_<bucket>.png` with category-color
+gradient fallback.
+
+**Air quality data source:** [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api)
+— backed by the Copernicus Atmosphere Monitoring Service (CAMS) model,
+global coverage (every coordinate on Earth), **no API key required**,
+free for non-commercial use. Picked after testing both OWM Air Pollution
+(sparse Mindanao coverage → reported AQI 1 on hazy days) and WAQI
+(good coverage but no Davao station registered).
+
+API call is two steps (geocode + air quality):
+```
+1. https://geocoding-api.open-meteo.com/v1/search
+   ?name=Davao&countryCode=PH&count=1&language=en&format=json
+2. https://air-quality-api.open-meteo.com/v1/air-quality
+   ?latitude=7.0731&longitude=125.6128
+   &current=us_aqi,pm10,pm2_5,ozone,nitrogen_dioxide
+   &timezone=auto
+```
+
+The geocode result is cached in memory (city + country rarely change),
+so subsequent air-quality calls skip step 1. Result cache default = 30
+min (pollutants move slower than temperature). `countryCode=PH` is what
+keeps "Davao" resolving to Davao City Philippines instead of Davao
+Costa Rica — the ISO code from `[weather].country` is reused.
+
+**Configurable fields** (`config.toml`):
+```toml
+[air_quality]
+enabled = true
+city = "Davao"   # blank → inherits from [weather].city
+country = "PH"   # blank → inherits from [weather].country (ISO-3166-1 alpha2)
+refresh_seconds = 1800
+# assets_dir = ""   # blank → <repo>/assets/air_quality/
+
+[top_tile]
+# "weather" or "air_quality" — flipped from the tray menu
+mode = "weather"
+```
+
+**Tray menu** (`right-click → after Force Refresh`):
+```
+─────────
+● Weather
+○ Air Quality
+─────────
+```
+The filled radio bullet shows the active payload. Picking either
+item flips the mode, persists to `config.toml`, and the next frame
+picks up the new payload — no restart needed.
+
+**US AQI breakpoints** (used for the bucket label + gradient):
+
+| AQI range | Label | State | Gradient color |
+|---|---|---|---|
+| 0–50 | Good | `good` | teal-green |
+| 51–100 | Moderate | `fair` | yellow-green |
+| 101–150 | Unhealthy (Sensitive) | `moderate` | warm yellow |
+| 151–200 | Unhealthy | `poor` | orange |
+| 201–300 | Very Unhealthy | `very_poor` | deep red |
+| 301+ | Hazardous | `very_poor` | deep red |
+
+**Disabled-air-quality fallback:** if `air_quality.enabled=false` or the
+fetch fails, the tile still renders — greeting is real, location shows
+"set [air_quality] enabled = true" (or the fetch error), big AQI shows "—",
+pollutants show "—". The `good_morning` background (or generated
+gradient) is used so the disabled state looks intentional.
+
+**Custom backgrounds:** drop 462×280 PNGs into
+`assets/air_quality/<aqi_state>_<time_bucket>.png` — 5 states × 5
+buckets = 25 files max. Missing files fall back to `good_morning.png`,
+then to a generated category-color gradient. See
+`assets/air_quality/README.md`.
+
+---
+
 ## PROTOCOL — LY Bulk chunked JPEG
 
 Reference docs:

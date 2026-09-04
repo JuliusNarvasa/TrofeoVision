@@ -25,8 +25,9 @@ from .driver import Driver, DriverError
 from .history import HistoryBuffer
 from .renderer import Renderer
 from .sensors import SensorReader
-from .sensors_types import SensorSnapshot, WeatherStats
+from .sensors_types import SensorSnapshot, WeatherStats, AirQualityStats
 from .weather import WeatherClient, WeatherImages
+from .air_quality import AirQualityClient, AirQualityImages
 
 
 log = logging.getLogger("trofeo_vision")
@@ -60,7 +61,8 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient) -> SensorSnapshot:
+def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient,
+                          air_quality: AirQualityClient) -> SensorSnapshot:
     snap = sensors.snapshot
     if not isinstance(snap.weather, WeatherStats) or not snap.weather.available:
         snap = SensorSnapshot(
@@ -68,6 +70,15 @@ def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient) -> Sens
             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
             net=snap.net,
             weather=weather.get(),
+            air_quality=snap.air_quality,
+        )
+    if not isinstance(snap.air_quality, AirQualityStats) or not snap.air_quality.available:
+        snap = SensorSnapshot(
+            timestamp=snap.timestamp,
+            cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
+            net=snap.net,
+            weather=snap.weather,
+            air_quality=air_quality.get(),
         )
     return snap
 
@@ -76,19 +87,23 @@ def run_dry(args, cfg: Config) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sensors = SensorReader(interval=cfg.usb.sensor_refresh_seconds, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
+    air_quality = AirQualityClient(cfg.air_quality)
     weather_images = _make_weather_images(cfg)
+    air_quality_images = _make_air_quality_images(cfg)
     history = HistoryBuffer()
     sensors.start()
     try:
         if args.once:
             time.sleep(0.5)
-            snap = snapshot_with_weather(sensors, weather)
+            snap = snapshot_with_weather(sensors, weather, air_quality)
             history.push(snap)
             r = Renderer(cfg.display.width, cfg.display.height)
             img = r.render(snap, history=history,
                            greeting_name=cfg.greeting.name,
                            weather_images=weather_images,
-                           theme_cfg=cfg.theme)
+                           theme_cfg=cfg.theme,
+                           top_tile_mode=cfg.top_tile.mode,
+                           air_quality_images=air_quality_images)
             png = args.out_dir / "frame.png"
             r.save_png(png)
             log.info("Saved %s (%dx%d)", png, img.width, img.height)
@@ -104,13 +119,15 @@ def run_dry(args, cfg: Config) -> int:
         log.info("Dry-run at %.1f fps, saving frames to %s", rate, args.out_dir)
         idx = 0
         while True:
-            snap = snapshot_with_weather(sensors, weather)
+            snap = snapshot_with_weather(sensors, weather, air_quality)
             history.push(snap)
             r = Renderer(cfg.display.width, cfg.display.height)
             r.render(snap, history=history,
                      greeting_name=cfg.greeting.name,
                      weather_images=weather_images,
-                     theme_cfg=cfg.theme)
+                     theme_cfg=cfg.theme,
+                     top_tile_mode=cfg.top_tile.mode,
+                     air_quality_images=air_quality_images)
             r.save_png(args.out_dir / f"frame_{idx:05d}.png")
             idx += 1
             if idx % 20 == 0:
@@ -126,7 +143,9 @@ def run_dry(args, cfg: Config) -> int:
 def run_live(args, cfg: Config) -> int:
     sensors = SensorReader(interval=cfg.usb.sensor_refresh_seconds, enable_lhm=not args.no_lhm)
     weather = WeatherClient(cfg.weather)
+    air_quality = AirQualityClient(cfg.air_quality)
     weather_images = _make_weather_images(cfg)
+    air_quality_images = _make_air_quality_images(cfg)
     history = HistoryBuffer()
     renderer = Renderer(cfg.display.width, cfg.display.height)
     driver = Driver(jpeg_quality=cfg.display.jpeg_quality)
@@ -154,12 +173,14 @@ def run_live(args, cfg: Config) -> int:
     try:
         if args.once:
             time.sleep(0.5)  # let one sensor tick happen
-            snap = snapshot_with_weather(sensors, weather)
+            snap = snapshot_with_weather(sensors, weather, air_quality)
             history.push(snap)
             renderer.render(snap, history=history,
                             greeting_name=cfg.greeting.name,
                             weather_images=weather_images,
-                            theme_cfg=cfg.theme)
+                            theme_cfg=cfg.theme,
+                            top_tile_mode=cfg.top_tile.mode,
+                            air_quality_images=air_quality_images)
             # Use driver.encode_jpeg() — rotates for the LCD orientation.
             jpeg = driver.encode_jpeg(renderer.image)
             stats = driver.push_frame(jpeg)
@@ -173,12 +194,14 @@ def run_live(args, cfg: Config) -> int:
         log.info("Pushing frames at %.1f fps", rate)
         while not stop["flag"]:
             try:
-                snap = snapshot_with_weather(sensors, weather)
+                snap = snapshot_with_weather(sensors, weather, air_quality)
                 history.push(snap)
                 renderer.render(snap, history=history,
                                 greeting_name=cfg.greeting.name,
                                 weather_images=weather_images,
-                                theme_cfg=cfg.theme)
+                                theme_cfg=cfg.theme,
+                                top_tile_mode=cfg.top_tile.mode,
+                                air_quality_images=air_quality_images)
                 # Use driver.encode_jpeg() — rotates for the LCD orientation.
                 jpeg = driver.encode_jpeg(renderer.image)
                 stats = driver.push_frame(jpeg)
@@ -220,6 +243,13 @@ def _make_weather_images(cfg: Config) -> WeatherImages:
     return WeatherImages(WeatherImages.default_assets_dir())
 
 
+def _make_air_quality_images(cfg: Config) -> AirQualityImages:
+    """Resolve the air-quality tile asset dir from config (with default fallback)."""
+    if cfg.air_quality.assets_dir:
+        return AirQualityImages(Path(cfg.air_quality.assets_dir))
+    return AirQualityImages(AirQualityImages.default_assets_dir())
+
+
 def _diagnose(sensors: SensorReader, driver_kind: str = "Driver") -> None:
     """Print LHM/USB state at startup so failures are visible immediately."""
     log.info("=== DIAGNOSE ===")
@@ -256,6 +286,8 @@ def main() -> int:
         cfg = Config(
             usb=cfg.usb,
             weather=cfg.weather,
+            air_quality=cfg.air_quality,
+            top_tile=cfg.top_tile,
             greeting=cfg.greeting,
             display=cfg.display,
             theme=cfg.theme,

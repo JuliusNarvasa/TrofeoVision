@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import Menu, MenuItem
 
-from .config import Config
+from .config import Config, TopTileConfig
 from .driver import Driver, DriverError
 from .history import HistoryBuffer
 from .power import PowerMonitor
@@ -38,6 +38,7 @@ from .renderer import Renderer
 from .sensors import SensorReader
 from .sensors_types import SensorSnapshot
 from .weather import WeatherClient, WeatherImages
+from .air_quality import AirQualityClient, AirQualityImages
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -130,6 +131,17 @@ class TrayApp:
     STATE_RECONNECTING = "reconnecting"   # USB device dropped (e.g. PC sleep/wake) — retrying
     STATE_ERROR = "error"
 
+    # ── USB ACCESS DENIED watchdog ─────────────────────────────────────────
+    # The recurring "USB stuck after sleep/wake" shape is libusb holding a
+    # stale claim that Windows won't release. Without escalation this spins
+    # forever producing thousands of identical log lines. After
+    # BACKOFF_THRESHOLD consecutive ACCESS DENIEDs (~60 s @ 2 s), back off
+    # to LONG_BACKOFF_S. After GIVEUP_THRESHOLD total cycles (~6 min),
+    # give up so the tray surfaces ERROR and the user can Force Refresh.
+    ACCESS_DENIED_BACKOFF_THRESHOLD = 30
+    ACCESS_DENIED_LONG_BACKOFF_S = 10.0
+    ACCESS_DENIED_GIVEUP_THRESHOLD = 60
+
     def __init__(self, cfg: Config, rate: Optional[float] = None,
                  verbose: bool = False):
         self.cfg = cfg
@@ -139,6 +151,11 @@ class TrayApp:
         self._lock = threading.Lock()
         self._state = self.STATE_STARTING
         self._error_msg = ""
+        # Active top-tile mode — initialized from config, flipped by the
+        # tray radio. The render thread reads it off self.cfg.top_tile.mode
+        # per frame; this field is the lock-protected source of truth for
+        # the menu bullet state.
+        self._top_tile_mode: str = cfg.top_tile.mode
         # Pause event: set() = running, clear() = paused. Render loop
         # waits on it before each frame.
         self._pause_evt = threading.Event()
@@ -148,6 +165,14 @@ class TrayApp:
         # Reconnect-log throttle: 0.0 means "no throttling yet, log the
         # next failure immediately". Updated in _open_with_reconnect.
         self._reconnect_last_log_at: float = 0.0
+        # Consecutive ACCESS DENIED count for the watchdog. Reset on
+        # success or Force Refresh. Only errno-13 failures count — other
+        # errors (device not found, etc.) don't trigger escalation.
+        self._access_denied_count: int = 0
+        # Force-refresh request: set from the tray menu callback, consumed
+        # + cleared by the render thread / reconnect loop. Setting it
+        # also kicks a fresh render thread if the previous one gave up.
+        self._force_refresh_evt = threading.Event()
 
         self._render_thread: Optional[threading.Thread] = None
         self._sensors: Optional[SensorReader] = None
@@ -182,6 +207,26 @@ class TrayApp:
                      visible=lambda _: self._safe_state() == self.STATE_RUNNING),
             MenuItem("Resume", self._on_resume,
                      visible=lambda _: self._safe_state() == self.STATE_PAUSED),
+            MenuItem("Force Refresh", self._on_force_refresh,
+                     # Always visible except during initial startup so the
+                     # user can manually kick a fresh USB recovery at any
+                     # time — most useful when state is RECONNECTING or
+                     # ERROR/STUCK, but harmless from RUNNING (just causes
+                     # a brief blip as the driver closes + reopens).
+                     visible=lambda _: self._safe_state() != self.STATE_STARTING),
+            Menu.SEPARATOR,
+            # Top-tile selector. Radio items: pystray draws the active
+            # choice with a bullet (●) so the user sees which payload
+            # the dashboard is currently showing. Picking either item
+            # flips [top_tile].mode in config.toml and the next frame
+            # picks up the new payload — no restart needed.
+            MenuItem("Weather", lambda i, it: self._on_choose_top_tile("weather"),
+                     radio=True,
+                     checked=lambda _: self._safe_top_tile_mode() == "weather"),
+            MenuItem("Air Quality", lambda i, it: self._on_choose_top_tile("air_quality"),
+                     radio=True,
+                     checked=lambda _: self._safe_top_tile_mode() == "air_quality"),
+            Menu.SEPARATOR,
             MenuItem("Open log folder", self._on_open_log),
             Menu.SEPARATOR,
             MenuItem("Quit", self._on_quit),
@@ -194,6 +239,18 @@ class TrayApp:
     def _safe_state_error(self) -> str:
         with self._lock:
             return self._error_msg[:80]
+
+    def _safe_top_tile_mode(self) -> str:
+        """Return the active top-tile mode under the lock.
+
+        pystray's ``checked`` lambda runs on the UI thread, but the
+        render thread reads ``self.cfg.top_tile.mode`` directly (no lock
+        needed — frozen dataclass + GIL atomic attr read). Keeping the
+        UI-side helper lock-protected means the radio bullet reflects
+        whichever value the latest menu click set, without flickering.
+        """
+        with self._lock:
+            return self._top_tile_mode
 
     def _format_state(self, state: str) -> str:
         """Map an internal state to its menu-label string. Called from
@@ -233,6 +290,69 @@ class TrayApp:
         self._set_state(self.STATE_RUNNING)
         log.info("Resumed")
 
+    def _on_force_refresh(self, _icon, _item) -> None:
+        """User-initiated USB recovery from the tray menu.
+
+        Closes the current driver (releases any stale libusb handle from
+        a pre-suspend state), resets the ACCESS DENIED watchdog counter,
+        and triggers a fresh ``open()`` cycle. If the render thread had
+        already exited (e.g. the watchdog gave up), this also restarts
+        it so they don't need to Quit + relaunch.
+
+        Safe to click from any non-STARTING state:
+            - RUNNING       → brief blip, driver closes + reopens, push resumes
+            - RECONNECTING  → bypasses the current backoff, retries immediately
+            - PAUSED        → resets the counter so a subsequent Resume
+                              starts from a clean state
+            - ERROR/STUCK   → restarts the render thread with a fresh Driver
+        """
+        log.info("Force refresh requested from tray menu")
+        self._force_refresh_evt.set()
+        with self._lock:
+            thread_dead = (self._render_thread is None
+                           or not self._render_thread.is_alive())
+            state = self._state
+        if thread_dead and state in (self.STATE_ERROR, self.STATE_STOPPED):
+            log.info("Force refresh: render thread is stopped, restarting")
+            self._start_render_thread()
+        self._refresh_menu()
+
+    def _on_choose_top_tile(self, mode: str) -> None:
+        """Tray radio callback: switch the top tile between weather and
+        air quality, persist the choice to config.toml.
+
+        The render thread picks up the new mode on the next frame — no
+        USB churn, no driver close/reopen, no restart. Persistence
+        happens via ``Config.save()`` so the choice survives a relaunch.
+        """
+        if mode not in ("weather", "air_quality"):
+            log.warning("Ignoring unknown top-tile mode: %s", mode)
+            return
+        with self._lock:
+            if self._top_tile_mode == mode:
+                return
+            self._top_tile_mode = mode
+            # Config is frozen — build a new instance with the updated
+            # mode. The render thread reads self.cfg.top_tile.mode each
+            # frame, so this swap is the only state the render loop cares
+            # about; the rest of cfg is unchanged.
+            self.cfg = Config(
+                usb=self.cfg.usb,
+                weather=self.cfg.weather,
+                air_quality=self.cfg.air_quality,
+                top_tile=TopTileConfig(mode=mode),
+                greeting=self.cfg.greeting,
+                display=self.cfg.display,
+                theme=self.cfg.theme,
+            )
+        log.info("Top tile mode → %s", mode)
+        try:
+            self.cfg.save()
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to persist top_tile mode to config.toml "
+                          "(the choice still applies for this session)")
+        self._refresh_menu()
+
     def _on_open_log(self, _icon, _item) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         # explorer.exe opens the folder highlighted.
@@ -268,10 +388,15 @@ class TrayApp:
                 interval=self.cfg.usb.sensor_refresh_seconds, enable_lhm=True,
             )
             weather = WeatherClient(self.cfg.weather)
+            air_quality = AirQualityClient(self.cfg.air_quality)
             assets_dir = (Path(self.cfg.weather.assets_dir)
                           if self.cfg.weather.assets_dir
                           else WeatherImages.default_assets_dir())
             weather_images = WeatherImages(assets_dir)
+            aq_assets_dir = (Path(self.cfg.air_quality.assets_dir)
+                             if self.cfg.air_quality.assets_dir
+                             else AirQualityImages.default_assets_dir())
+            air_quality_images = AirQualityImages(aq_assets_dir)
             history = HistoryBuffer()
             renderer = Renderer(self.cfg.display.width, self.cfg.display.height)
             driver = Driver(jpeg_quality=self.cfg.display.jpeg_quality)
@@ -301,6 +426,33 @@ class TrayApp:
                 self._pause_evt.wait()
                 if self._stop_evt.is_set():
                     break
+
+                # ── Force refresh ───────────────────────────────────────
+                # User-initiated from the tray menu. Close the driver to
+                # release any stale handle from a pre-suspend state, reset
+                # the ACCESS DENIED watchdog, then fall into the normal
+                # reconnect path. Doing this proactively (instead of
+                # waiting for the next push to fail) keeps the blip short.
+                if self._force_refresh_evt.is_set():
+                    self._force_refresh_evt.clear()
+                    log.info("Force refresh — closing USB device and reconnecting")
+                    self._access_denied_count = 0
+                    try:
+                        driver.close()
+                    except Exception:
+                        log.exception("Force refresh: error closing driver")
+                    self._set_state(self.STATE_RECONNECTING,
+                                    "force refresh from tray menu")
+                    if not self._open_with_reconnect(
+                            driver, self.RECONNECT_BACKOFF_S):
+                        return
+                    try:
+                        self._set_state(self.STATE_RUNNING)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "Force refresh: post-reconnect set_state failed",
+                        )
+                    continue  # skip the per-frame sleep + skip a frame
 
                 # ── Power events ────────────────────────────────────────
                 # Check suspend/resume between frames. Suspend fires BEFORE
@@ -336,6 +488,11 @@ class TrayApp:
 
                 try:
                     snap = sensors.snapshot
+                    # Refresh weather + air quality only when the snapshot
+                    # doesn't already have a live value — the sensor reader
+                    # may pre-fill these when it ticks, but on a fresh
+                    # process (or after the sensor reader skipped a tick)
+                    # we want to ensure the tile has current data.
                     if (not hasattr(snap.weather, "available")
                             or not snap.weather.available):
                         snap = SensorSnapshot(
@@ -343,14 +500,29 @@ class TrayApp:
                             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
                             net=snap.net,
                             weather=weather.get(),
+                            air_quality=snap.air_quality,
+                        )
+                    if (not hasattr(snap.air_quality, "available")
+                            or not snap.air_quality.available):
+                        snap = SensorSnapshot(
+                            timestamp=snap.timestamp,
+                            cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
+                            net=snap.net,
+                            weather=snap.weather,
+                            air_quality=air_quality.get(),
                         )
                     history.push(snap)
+                    # self.cfg.top_tile.mode is the source of truth — it
+                    # updates atomically when the tray radio fires. No
+                    # lock needed on the render thread side.
                     renderer.render(
                         snap,
                         history=history,
                         greeting_name=self.cfg.greeting.name,
                         weather_images=weather_images,
                         theme_cfg=self.cfg.theme,
+                        top_tile_mode=self.cfg.top_tile.mode,
+                        air_quality_images=air_quality_images,
                     )
                     jpeg = driver.encode_jpeg(renderer.image)
                     stats = driver.push_frame(jpeg)
@@ -399,38 +571,114 @@ class TrayApp:
 
     def _open_with_reconnect(self, driver: Driver, backoff_s: float) -> bool:
         """Try to open the driver; on failure, retry with backoff until
-        success or ``stop`` is requested.
+        success, stop, or the ACCESS DENIED watchdog gives up.
 
         Returns ``True`` if ``driver.open()`` succeeded, ``False`` if the
-        user asked to quit while we were waiting. While waiting the state
-        is set to ``RECONNECTING`` so the tray menu surfaces it.
+        user asked to quit while we were waiting OR the watchdog
+        escalated past ``ACCESS_DENIED_GIVEUP_THRESHOLD``. While waiting
+        the state is set to ``RECONNECTING`` so the tray menu surfaces
+        it; on giveup the state flips to ``ERROR``.
 
-        Logging is throttled to once every 30 s after the *first*
-        failure (always emitted immediately) so an hour of retries
+        Logging is throttled to once every 30 s so an hour of retries
         doesn't produce 1800 identical log lines. State flips and the
         ``_wait_or_stop`` sleep still happen on every retry.
+
+        Force-refresh: ``_force_refresh_evt`` is checked at the top of
+        each loop iteration. Setting it (from the tray menu) resets the
+        ACCESS DENIED watchdog, closes the driver to release any stale
+        handle, and falls through to a fresh ``driver.open()`` attempt
+        without waiting for the current backoff.
         """
         while not self._stop_evt.is_set():
+            # Force-refresh: user wants a fresh attempt RIGHT NOW.
+            if self._force_refresh_evt.is_set():
+                self._force_refresh_evt.clear()
+                log.info("Force refresh — resetting USB recovery state")
+                self._access_denied_count = 0
+                try:
+                    driver.close()
+                except Exception:
+                    log.debug("Force refresh: driver.close() raised",
+                              exc_info=True)
+
             try:
                 driver.open()
             except DriverError as e:
                 self._set_state(self.STATE_RECONNECTING, str(e))
+
+                # Track ACCESS DENIED specifically (errno 13). All other
+                # failures (device-not-found, etc.) keep the normal
+                # backoff and don't count toward the watchdog — only the
+                # persistent-stale-claim storm should escalate.
+                is_access_denied = getattr(e, "errno", None) == 13
+                if is_access_denied:
+                    self._access_denied_count += 1
+                else:
+                    self._access_denied_count = 0
+
+                # Escalate the backoff once the storm has lasted long
+                # enough to be clearly a stuck-handle issue.
+                current_backoff = (
+                    self.ACCESS_DENIED_LONG_BACKOFF_S
+                    if self._access_denied_count >= self.ACCESS_DENIED_BACKOFF_THRESHOLD
+                    else backoff_s
+                )
+
+                # Throttled log — one per 30 s, plus the count for diagnostics.
                 now = time.monotonic()
-                # 0.0 sentinel = "no prior log in this reconnect series";
-                # also handles the case where a previous series left a
-                # stale timestamp < 30 s ago but we successfully
-                # reconnected — see the reset below.
                 if (self._reconnect_last_log_at == 0.0
                         or (now - self._reconnect_last_log_at) >= 30.0):
-                    log.info("USB not available (%s) — retrying in %.1fs",
-                             e, backoff_s)
+                    suffix = (f" (ACCESS DENIED x{self._access_denied_count}, "
+                              f"backoff {current_backoff:.1f}s)"
+                              if is_access_denied else "")
+                    log.info("USB not available (%s)%s — retrying in %.1fs",
+                             e, suffix, current_backoff)
                     self._reconnect_last_log_at = now
-                if self._wait_or_stop(backoff_s):
+
+                # One-shot warning when we first cross the escalation
+                # threshold so it's obvious in the log what changed.
+                if self._access_denied_count == self.ACCESS_DENIED_BACKOFF_THRESHOLD:
+                    log.warning(
+                        "USB ACCESS DENIED %dx — escalating backoff to "
+                        "%.1fs (was %.1fs). Likely stale libusb handle "
+                        "from post-suspend; if this persists, Force "
+                        "Refresh from the tray menu or Quit + relaunch.",
+                        self._access_denied_count, current_backoff, backoff_s,
+                    )
+
+                # Watchdog giveup: stop spinning so the user can Force
+                # Refresh or Quit instead of waiting forever.
+                if self._access_denied_count >= self.ACCESS_DENIED_GIVEUP_THRESHOLD:
+                    elapsed_min = int(round(
+                        self.ACCESS_DENIED_BACKOFF_THRESHOLD * backoff_s / 60
+                        + (self.ACCESS_DENIED_GIVEUP_THRESHOLD
+                           - self.ACCESS_DENIED_BACKOFF_THRESHOLD)
+                        * self.ACCESS_DENIED_LONG_BACKOFF_S / 60
+                    ))
+                    log.error(
+                        "USB unreachable after %d ACCESS DENIED attempts "
+                        "(~%d min). Giving up — stale handle suspected. "
+                        "Use 'Force Refresh' in the tray menu, or Quit "
+                        "and relaunch via start.bat / the TrofeoVision "
+                        "scheduled task.",
+                        self._access_denied_count, elapsed_min,
+                    )
+                    self._set_state(
+                        self.STATE_ERROR,
+                        f"USB unreachable after {self._access_denied_count} "
+                        "ACCESS DENIED attempts. Force Refresh or Quit + "
+                        "relaunch.",
+                    )
+                    return False
+
+                if self._wait_or_stop(current_backoff):
                     return False
                 continue
-            # Success: reset the throttle so the *next* failure series
-            # logs its first attempt immediately.
+            # Success — reset both throttles so the next failure series
+            # logs its first attempt immediately and the watchdog starts
+            # counting from zero.
             self._reconnect_last_log_at = 0.0
+            self._access_denied_count = 0
             return True
         return False
 

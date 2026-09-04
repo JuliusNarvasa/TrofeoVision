@@ -155,6 +155,31 @@ class WeatherStats:
 
 
 @dataclass(frozen=True)
+class AirQualityStats:
+    """Live air quality snapshot — mirrors ``WeatherStats`` shape.
+
+    Populated by ``AirQualityClient`` (Open-Meteo Air Quality API). ``aqi``
+    is the numeric US AQI value (0–500); ``aqi_label`` is the bucket
+    name (``good`` … ``very_poor``) that doubles as the asset filename
+    stem and the background-gradient state.
+
+    Pollutants in ``components`` are μg/m³ (PM2.5, PM10) or μg/m³ (O₃,
+    NO₂) depending on the pollutant. The renderer only displays
+    PM2.5/PM10 on the tile; the full dict is preserved for downstream
+    consumers that want the headline US AQI or the gas readings.
+    """
+
+    available: bool = False
+    location: str = ""
+    aqi: int = 0              # 1–5 (European scale)
+    aqi_label: str = ""       # "good" | "fair" | "moderate" | "poor" | "very_poor"
+    pm25: float = 0.0         # μg/m³
+    pm10: float = 0.0         # μg/m³
+    components: dict = field(default_factory=dict)
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class SensorSnapshot:
     """All live data needed to render one frame."""
 
@@ -164,3 +189,4 @@ class SensorSnapshot:
     mem: MemDiskStats = field(default_factory=MemDiskStats)
     net: NetStats = field(default_factory=NetStats)
     weather: WeatherStats = field(default_factory=WeatherStats)
+    air_quality: AirQualityStats = field(default_factory=AirQualityStats)
