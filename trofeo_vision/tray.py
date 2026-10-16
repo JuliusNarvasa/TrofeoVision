@@ -493,23 +493,37 @@ class TrayApp:
                     # may pre-fill these when it ticks, but on a fresh
                     # process (or after the sensor reader skipped a tick)
                     # we want to ensure the tile has current data.
+                    # Each fetch is wrapped so an API bug can never kill
+                    # the frame loop (dead API → placeholder tile).
                     if (not hasattr(snap.weather, "available")
                             or not snap.weather.available):
+                        try:
+                            fresh_weather = weather.get()
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("Weather get() raised (%s) — "
+                                        "keeping previous value", e)
+                            fresh_weather = snap.weather
                         snap = SensorSnapshot(
                             timestamp=snap.timestamp,
                             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
                             net=snap.net,
-                            weather=weather.get(),
+                            weather=fresh_weather,
                             air_quality=snap.air_quality,
                         )
                     if (not hasattr(snap.air_quality, "available")
                             or not snap.air_quality.available):
+                        try:
+                            fresh_aq = air_quality.get()
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("Air quality get() raised (%s) — "
+                                        "keeping previous value", e)
+                            fresh_aq = snap.air_quality
                         snap = SensorSnapshot(
                             timestamp=snap.timestamp,
                             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
                             net=snap.net,
                             weather=snap.weather,
-                            air_quality=air_quality.get(),
+                            air_quality=fresh_aq,
                         )
                     history.push(snap)
                     # self.cfg.top_tile.mode is the source of truth — it
@@ -553,6 +567,12 @@ class TrayApp:
                             inner_exc,
                         )
                     continue  # skip the per-frame sleep after a reconnect
+                except Exception:  # noqa: BLE001 — non-USB failure (render,
+                    # sensor, weather/AQI): log + keep pushing next frame.
+                    # Only DriverError triggers the USB reconnect path above.
+                    log.exception("Frame failed (non-USB) — continuing push")
+                    # Fall through to the interruptible sleep below so a
+                    # persistently failing frame can't hot-spin the loop.
 
                 # Sleep but stay responsive to stop/pause.
                 self._interruptible_sleep(sleep_s)

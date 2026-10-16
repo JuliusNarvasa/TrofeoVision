@@ -85,21 +85,33 @@ def main() -> int:
             snap = sensors.snapshot
             # Fill weather + air quality on the snapshot if the sensor
             # reader didn't already have a live value for this frame.
+            # Each fetch is wrapped so a dead/buggy API can never kill
+            # the render loop — failures render as placeholder tiles.
             if not snap.weather.available:
+                try:
+                    fresh_weather = weather.get()
+                except Exception as e:  # noqa: BLE001
+                    print(f"weather get() raised ({e}) — keeping previous value")
+                    fresh_weather = snap.weather
                 snap = SensorSnapshot(
                     timestamp=snap.timestamp,
                     cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
                     net=snap.net,
-                    weather=weather.get(),
+                    weather=fresh_weather,
                     air_quality=snap.air_quality,
                 )
             if not snap.air_quality.available:
+                try:
+                    fresh_aq = air_quality.get()
+                except Exception as e:  # noqa: BLE001
+                    print(f"air quality get() raised ({e}) — keeping previous value")
+                    fresh_aq = snap.air_quality
                 snap = SensorSnapshot(
                     timestamp=snap.timestamp,
                     cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
                     net=snap.net,
                     weather=snap.weather,
-                    air_quality=air_quality.get(),
+                    air_quality=fresh_aq,
                 )
             history.push(snap)
             renderer.render(snap, history=history,

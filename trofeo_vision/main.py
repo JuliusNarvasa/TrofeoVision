@@ -61,6 +61,27 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _safe_weather_get(weather: WeatherClient, fallback: WeatherStats) -> WeatherStats:
+    """Call ``weather.get()`` without ever raising — returns ``fallback``
+    (the snapshot's current value) on any unexpected exception."""
+    try:
+        return weather.get()
+    except Exception as e:  # noqa: BLE001 — frame loop must survive API bugs
+        log.warning("Weather get() raised (%s) — keeping previous value", e)
+        return fallback
+
+
+def _safe_air_quality_get(air_quality: AirQualityClient,
+                          fallback: AirQualityStats) -> AirQualityStats:
+    """Call ``air_quality.get()`` without ever raising — returns ``fallback``
+    (the snapshot's current value) on any unexpected exception."""
+    try:
+        return air_quality.get()
+    except Exception as e:  # noqa: BLE001 — frame loop must survive API bugs
+        log.warning("Air quality get() raised (%s) — keeping previous value", e)
+        return fallback
+
+
 def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient,
                           air_quality: AirQualityClient) -> SensorSnapshot:
     snap = sensors.snapshot
@@ -69,7 +90,7 @@ def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient,
             timestamp=snap.timestamp,
             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
             net=snap.net,
-            weather=weather.get(),
+            weather=_safe_weather_get(weather, snap.weather),
             air_quality=snap.air_quality,
         )
     if not isinstance(snap.air_quality, AirQualityStats) or not snap.air_quality.available:
@@ -78,7 +99,7 @@ def snapshot_with_weather(sensors: SensorReader, weather: WeatherClient,
             cpu=snap.cpu, gpu=snap.gpu, mem=snap.mem,
             net=snap.net,
             weather=snap.weather,
-            air_quality=air_quality.get(),
+            air_quality=_safe_air_quality_get(air_quality, snap.air_quality),
         )
     return snap
 
@@ -226,6 +247,12 @@ def run_live(args, cfg: Config) -> int:
                         break
                     except DriverError as e2:
                         log.info("USB still unavailable (%s) — retrying", e2)
+                continue
+            except Exception:  # noqa: BLE001 — non-USB failure (render,
+                # sensor, weather/AQI): log + keep pushing next frame.
+                # Only DriverError triggers the USB reconnect path above.
+                log.exception("Frame failed (non-USB) — continuing push")
+                time.sleep(sleep_s)
                 continue
             time.sleep(sleep_s)
     except KeyboardInterrupt:

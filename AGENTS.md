@@ -526,3 +526,4 @@ start. The 30 s logon delay dodges the UAC prompt race at first login.
 4. **JPEG decoder is baseline only** — no progressive, must use `quality=85, subsampling=0`
 5. **Display blanks when frames stop** — must push continuously, not just one frame
 6. **psutil.cpu_percent per-CPU values** — we report overall %, not per-core
+7. **Weather/AQ outage resilience (Oct 2026)** — `WeatherClient`/`AirQualityClient` use 5 s timeout + 60 s failure backoff (negative cache) + never-raise `get()` (placeholder tile on failure); `main.py`/`tray.py`/`render_offline.py` wrap refetch so API bugs can't stall/kill the frame loop — only `DriverError` triggers USB reconnect

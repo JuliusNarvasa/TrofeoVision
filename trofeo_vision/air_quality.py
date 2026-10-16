@@ -305,27 +305,55 @@ class AirQualityClient:
     # european_aqi which would also work, but US AQI is what most people
     # reading AirNow / AirVisual are used to.
     CURRENT_FIELDS = "us_aqi,pm10,pm2_5,ozone,nitrogen_dioxide"
+    # Short timeout so a dead API stalls one frame for ~5 s max instead of
+    # 10 s+. Per-frame refetch callers only refetch while `not available`,
+    # and the failure backoff below keeps a down API from stalling frames.
+    REQUEST_TIMEOUT_S = 5.0
+    # Negative cache: after a failure, serve the placeholder (or last-good
+    # cache) immediately without hitting the network for this long.
+    FAILURE_BACKOFF_S = 60.0
 
     def __init__(self, cfg: AirQualityConfig):
         self.cfg = cfg
         self._cached: Optional[AirQualityStats] = None
         self._last_fetch = 0.0
+        self._last_failure = 0.0
+        self._last_error = ""
         # Geocode cache: (city, country) → (lat, lon, display_name).
         # Country filter is what keeps "Davao" pointing at the PH one.
         self._geo_cache: dict[tuple[str, str], tuple[float, float, str]] = {}
 
     def get(self) -> AirQualityStats:
-        if not self.cfg.enabled:
-            return AirQualityStats(available=False, error="air quality disabled")
-        if self._cached and (time.time() - self._last_fetch) < self.cfg.refresh_seconds:
-            return self._cached
-        return self._fetch()
+        """Return cached air quality, refreshing when stale. Never raises —
+        on any failure path returns last-good cache or an
+        ``available=False`` placeholder so the frame loop keeps pushing.
+        """
+        try:
+            if not self.cfg.enabled:
+                return AirQualityStats(available=False, error="air quality disabled")
+            now = time.time()
+            if self._cached and (now - self._last_fetch) < self.cfg.refresh_seconds:
+                return self._cached
+            # Negative cache: don't hammer a dead API every frame.
+            if (self._last_failure
+                    and (now - self._last_failure) < self.FAILURE_BACKOFF_S):
+                if self._cached:
+                    return self._cached
+                return AirQualityStats(available=False, error=self._last_error or "backing off")
+            return self._fetch()
+        except Exception as e:  # noqa: BLE001 — get() must never raise
+            log.warning("Air quality get() unexpected error: %s", e)
+            if self._cached:
+                return self._cached
+            return AirQualityStats(available=False, error=f"unexpected: {e}")
 
     def _fetch(self) -> AirQualityStats:
         try:
             lat, lon, location = self._geocode()
         except _AirQualityError as e:
             return self._fail(f"geocode: {e}")
+        except Exception as e:  # noqa: BLE001 — _geocode must never escape raw
+            return self._fail(f"geocode unexpected: {e}")
 
         params = {
             "latitude": f"{lat:.4f}",
@@ -334,13 +362,21 @@ class AirQualityClient:
             "timezone": "auto",
         }
         try:
-            r = requests.get(self.AIR_URL, params=params, timeout=10)
+            r = requests.get(self.AIR_URL, params=params,
+                             timeout=self.REQUEST_TIMEOUT_S)
         except requests.RequestException as e:
             log.warning("Air quality fetch failed: %s", e)
             return self._fail(f"network error: {e}")
+        except Exception as e:  # noqa: BLE001 — never let _fetch raise
+            log.warning("Air quality fetch unexpected error: %s", e)
+            return self._fail(f"unexpected: {e}")
 
         if r.status_code != 200:
-            return self._fail(f"HTTP {r.status_code}: {r.text[:120]}")
+            try:
+                body = r.text[:120]
+            except Exception:  # noqa: BLE001
+                body = "<unreadable body>"
+            return self._fail(f"HTTP {r.status_code}: {body}")
 
         try:
             payload = r.json()
@@ -349,6 +385,7 @@ class AirQualityClient:
             return self._fail(f"parse error: {e}")
 
         self._last_fetch = time.time()
+        self._last_failure = 0.0
         return self._cached
 
     def _geocode(self) -> tuple[float, float, str]:
@@ -375,20 +412,31 @@ class AirQualityClient:
         if self.cfg.country:
             params["countryCode"] = self.cfg.country
         try:
-            r = requests.get(self.GEO_URL, params=params, timeout=10)
+            r = requests.get(self.GEO_URL, params=params,
+                             timeout=self.REQUEST_TIMEOUT_S)
         except requests.RequestException as e:
             raise _AirQualityError(f"network error: {e}") from e
         if r.status_code != 200:
-            raise _AirQualityError(f"HTTP {r.status_code}: {r.text[:120]}")
-        results = r.json().get("results") or []
+            try:
+                body = r.text[:120]
+            except Exception:  # noqa: BLE001
+                body = "<unreadable body>"
+            raise _AirQualityError(f"HTTP {r.status_code}: {body}")
+        try:
+            results = r.json().get("results") or []
+        except Exception as e:  # noqa: BLE001 — malformed body, not a crash
+            raise _AirQualityError(f"unparseable geocode body: {e}") from e
         if not results:
             raise _AirQualityError(
                 f"no geocoding results for {city}"
                 + (f", {self.cfg.country}" if self.cfg.country else "")
             )
         first = results[0]
-        lat = float(first["latitude"])
-        lon = float(first["longitude"])
+        try:
+            lat = float(first["latitude"])
+            lon = float(first["longitude"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise _AirQualityError(f"bad geocode coords: {e}") from e
         display = (
             f"{first.get('name', city)}, {first.get('country', self.cfg.country)}"
         )
@@ -448,6 +496,8 @@ class AirQualityClient:
 
     def _fail(self, msg: str) -> AirQualityStats:
         log.warning("Air quality: %s", msg)
+        self._last_failure = time.time()
+        self._last_error = msg
         if self._cached:
             return self._cached
         return AirQualityStats(available=False, error=msg)

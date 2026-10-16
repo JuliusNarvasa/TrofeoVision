@@ -180,18 +180,45 @@ class WeatherImages:
 
 class WeatherClient:
     BASE_URL = "https://api.openweathermap.org/data/2.5/forecast"
+    # Short timeout so a dead API stalls one frame for ~5 s max instead of
+    # 10 s+. Per-frame refetch callers (main/tray/offline) only refetch
+    # while `not available`, and the failure backoff below keeps a down
+    # API from stalling every frame.
+    REQUEST_TIMEOUT_S = 5.0
+    # Negative cache: after a failure, serve the placeholder (or last-good
+    # cache) immediately without hitting the network for this long.
+    FAILURE_BACKOFF_S = 60.0
 
     def __init__(self, cfg: WeatherConfig):
         self.cfg = cfg
         self._cached: Optional[WeatherStats] = None
         self._last_fetch = 0.0
+        self._last_failure = 0.0
+        self._last_error = ""
 
     def get(self) -> WeatherStats:
-        if not self.cfg.enabled or not self.cfg.api_key:
-            return WeatherStats(available=False, error="weather disabled")
-        if self._cached and (time.time() - self._last_fetch) < self.cfg.refresh_seconds:
-            return self._cached
-        return self._fetch()
+        """Return cached weather, refreshing when stale. Never raises —
+        on any failure path returns last-good cache or an
+        ``available=False`` placeholder so the frame loop keeps pushing.
+        """
+        try:
+            if not self.cfg.enabled or not self.cfg.api_key:
+                return WeatherStats(available=False, error="weather disabled")
+            now = time.time()
+            if self._cached and (now - self._last_fetch) < self.cfg.refresh_seconds:
+                return self._cached
+            # Negative cache: don't hammer a dead API every frame.
+            if (self._last_failure
+                    and (now - self._last_failure) < self.FAILURE_BACKOFF_S):
+                if self._cached:
+                    return self._cached
+                return WeatherStats(available=False, error=self._last_error or "backing off")
+            return self._fetch()
+        except Exception as e:  # noqa: BLE001 — get() must never raise
+            log.warning("Weather get() unexpected error: %s", e)
+            if self._cached:
+                return self._cached
+            return WeatherStats(available=False, error=f"unexpected: {e}")
 
     def _fetch(self) -> WeatherStats:
         params = {
@@ -200,13 +227,21 @@ class WeatherClient:
             "units": self.cfg.units,
         }
         try:
-            r = requests.get(self.BASE_URL, params=params, timeout=10)
+            r = requests.get(self.BASE_URL, params=params,
+                             timeout=self.REQUEST_TIMEOUT_S)
         except requests.RequestException as e:
             log.warning("Weather fetch failed: %s", e)
             return self._fail(f"network error: {e}")
+        except Exception as e:  # noqa: BLE001 — never let _fetch raise
+            log.warning("Weather fetch unexpected error: %s", e)
+            return self._fail(f"unexpected: {e}")
 
         if r.status_code != 200:
-            return self._fail(f"HTTP {r.status_code}: {r.text[:120]}")
+            try:
+                body = r.text[:120]
+            except Exception:  # noqa: BLE001
+                body = "<unreadable body>"
+            return self._fail(f"HTTP {r.status_code}: {body}")
 
         try:
             data = r.json()
@@ -215,6 +250,7 @@ class WeatherClient:
             return self._fail(f"parse error: {e}")
 
         self._last_fetch = time.time()
+        self._last_failure = 0.0
         return self._cached
 
     def _parse(self, data: dict) -> WeatherStats:
@@ -273,6 +309,8 @@ class WeatherClient:
 
     def _fail(self, msg: str) -> WeatherStats:
         log.warning("Weather: %s", msg)
+        self._last_failure = time.time()
+        self._last_error = msg
         # Keep the cache if we have one — show last known good.
         if self._cached:
             return self._cached
